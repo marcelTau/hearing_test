@@ -10,7 +10,7 @@ To create a release for other people, run this on a machine with Docker and
 BuildKit (Rust and Cargo are installed inside the build container):
 
 ```sh
-./build-ubuntu.sh
+./scripts/build-ubuntu.sh
 ```
 
 The script builds the release executable inside an Ubuntu 22.04 container and
@@ -35,7 +35,7 @@ Results are stored in the user's data directory, independently of the executable
 On a normal Ubuntu Desktop installation, open a terminal and run:
 
 ```sh
-./run-ubuntu.sh
+./scripts/run-ubuntu.sh
 ```
 
 The script installs missing build tools and ALSA development headers through

@@ -4,7 +4,7 @@ set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cat <<'HELP'
-Usage: ./run-ubuntu.sh
+Usage: ./scripts/run-ubuntu.sh
 
 Installs Ubuntu build prerequisites and stable Rust (including Cargo),
 then builds and launches Hearing Tracker. Requires internet access and sudo
@@ -28,9 +28,9 @@ source /etc/os-release
 [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]] ||
     die 'Run this script from a terminal in your Ubuntu desktop session (X11 or Wayland).'
 
-project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 [[ -f "$project_dir/Cargo.toml" && -f "$project_dir/Cargo.lock" ]] ||
-    die 'Keep this script in the Hearing Tracker repository alongside Cargo.toml and Cargo.lock.'
+    die 'Keep this script in the repository scripts/ directory, with Cargo.toml and Cargo.lock in its parent directory.'
 
 # Ubuntu Desktop supplies the audio/graphics runtime libraries. This project's
 # Wayland support uses dlopen, so Wayland development headers aren't needed.
