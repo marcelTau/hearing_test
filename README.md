@@ -4,12 +4,38 @@ Hearing Tracker is an offline Linux desktop application for personal, repeatable
 
 It is deliberately **not** a medical device or diagnostic audiometer. AirPods and normal computer audio are not calibrated for clinical `dB HL`, and their fit, processing, volume, and the room all affect results. The app therefore reports an internal relative scale (`dB-R`) and only compares tests made with the same recorded setup.
 
-## Build and run on Ubuntu
+## Prebuilt Ubuntu executable
+
+To create a release for other people, run this on a machine with Docker and
+BuildKit (Rust and Cargo are installed inside the build container):
+
+```sh
+./scripts/build-ubuntu.sh
+```
+
+The script builds the release executable inside an Ubuntu 22.04 container and
+exports it to `dist/hearing-test`, alongside `dist/hearing-test.sha256`.
+Share those files. Recipients can launch the executable from a terminal:
+
+```sh
+chmod +x hearing-test  # Needed once if the download loses executable permission.
+./hearing-test
+```
+
+The executable targets standard Ubuntu 22.04 and newer Desktop installations
+on Intel/AMD 64-bit machines. Docker, Rust, Cargo, compilers, and development
+headers are required only on the build machine. The executable uses Ubuntu
+Desktop's existing ALSA and graphics runtime libraries; these are not bundled.
+The target is a normal Desktop installation, not a bare Ubuntu Server or Docker
+image with missing desktop libraries. ARM machines need a separate build.
+Results are stored in the user's data directory, independently of the executable.
+
+## Build from source and run on Ubuntu
 
 On a normal Ubuntu Desktop installation, open a terminal and run:
 
 ```sh
-./run-ubuntu.sh
+./scripts/run-ubuntu.sh
 ```
 
 The script installs missing build tools and ALSA development headers through

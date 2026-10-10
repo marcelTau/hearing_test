@@ -1,0 +1,29 @@
+FROM ubuntu:22.04 AS build
+
+# Build against Ubuntu 22.04's glibc so the binary can also run on newer Ubuntu
+# desktops. Rust, compilers, and development headers stay in this build stage.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential pkg-config curl ca-certificates libasound2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+ARG RUST_TOOLCHAIN=stable
+RUN curl --proto '=https' --tlsv1.2 --fail --show-error --silent \
+        https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y --profile minimal \
+        --default-toolchain "$RUST_TOOLCHAIN" --no-modify-path \
+    && rm /tmp/rustup-init.sh
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+ARG BUILD_JOBS=2
+RUN cargo build --locked --release --bin hearing_test --jobs "$BUILD_JOBS" \
+    && strip --strip-unneeded target/release/hearing_test
+
+# Export only the executable, without a container or Rust installation.
+FROM scratch AS binary
+COPY --from=build /app/target/release/hearing_test /hearing-test

@@ -1,0 +1,9 @@
+# Only send the application's sources and manifests to the Docker build.
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!packaging/
+!packaging/Dockerfile.ubuntu
+!packaging/Dockerfile.ubuntu.dockerignore
