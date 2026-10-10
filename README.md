@@ -4,6 +4,36 @@ Hearing Tracker is an offline Linux desktop application for personal, repeatable
 
 It is deliberately **not** a medical device or diagnostic audiometer. AirPods and normal computer audio are not calibrated for clinical `dB HL`, and their fit, processing, volume, and the room all affect results. The app therefore reports an internal relative scale (`dB-R`) and only compares tests made with the same recorded setup.
 
+## Build and run on Ubuntu
+
+On a normal Ubuntu Desktop installation, open a terminal and run:
+
+```sh
+./run-ubuntu.sh
+```
+
+The script installs missing build tools and ALSA development headers through
+APT, installs Rust and Cargo through [rustup](https://rust-lang.github.io/rustup/installation/)
+if needed, ensures the current stable Rust toolchain is available, then builds
+and launches the app in release mode using `Cargo.lock`. No preinstalled Rust,
+Cargo, or development libraries are required. Internet access and a user with
+`sudo` access are needed for setup; run the script as your normal user, without
+`sudo`. The first build can take several minutes.
+
+You can run the script again after changing the source. It works from any
+directory when invoked by its path and reuses installed packages and previous
+build output. It relies on the audio/graphics runtime libraries supplied by
+Ubuntu Desktop. Its APT package list is limited to `build-essential`,
+`pkg-config`, `curl`, `ca-certificates`, and
+[`libasound2-dev`](https://github.com/RustAudio/cpal#linux-build-dependencies),
+and it only installs packages that are missing.
+After setup, you can also launch the built app directly, without setup checks or
+internet access:
+
+```sh
+./target/release/hearing_test
+```
+
 ## Build and run on Fedora
 
 Install Rust and CPAL's required ALSA development headers, then run the app:
