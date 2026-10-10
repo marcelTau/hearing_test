@@ -9,6 +9,7 @@ use crate::localization::{Language, LocalizedText, Text};
 use crate::report;
 use crate::storage::SessionRepository;
 use crate::test_engine::{Presentation, TestEngine};
+use crate::theme;
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
@@ -16,7 +17,7 @@ use rand::Rng;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Page {
     Dashboard,
     Setup,
@@ -43,6 +44,7 @@ struct Message {
 }
 
 struct SetupState {
+    step: SetupStep,
     devices: Vec<AudioDeviceInfo>,
     selected_device: usize,
     audio: Option<AudioEngine>,
@@ -55,9 +57,46 @@ struct SetupState {
     next_token: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+enum SetupStep {
+    #[default]
+    Device,
+    Room,
+    Sound,
+    Ready,
+}
+
+impl SetupStep {
+    const ALL: [Self; 4] = [Self::Device, Self::Room, Self::Sound, Self::Ready];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|step| *step == self).unwrap()
+    }
+}
+
+impl SetupState {
+    fn ready(&self) -> bool {
+        self.devices.get(self.selected_device).is_some()
+            && self.quiet_room
+            && self.noise_cancellation
+            && self.processing_off
+            && self.comfortable
+    }
+
+    fn can_continue(&self) -> bool {
+        match self.step {
+            SetupStep::Device => self.devices.get(self.selected_device).is_some(),
+            SetupStep::Room => self.quiet_room && self.noise_cancellation && self.processing_off,
+            SetupStep::Sound => self.comfortable,
+            SetupStep::Ready => self.ready(),
+        }
+    }
+}
+
 impl Default for SetupState {
     fn default() -> Self {
         Self {
+            step: SetupStep::Device,
             devices: Vec::new(),
             selected_device: 0,
             audio: None,
@@ -100,9 +139,7 @@ enum TestAction {
 
 impl HearingApp {
     pub fn new(context: &eframe::CreationContext<'_>) -> Self {
-        context.egui_ctx.style_mut_of(egui::Theme::Light, |style| {
-            style.spacing.button_padding = Vec2::new(14.0, 8.0);
-        });
+        theme::configure(&context.egui_ctx);
         let (repository, sessions, display_name, message) = match SessionRepository::open_default()
         {
             Ok(repository) => {
@@ -228,6 +265,7 @@ impl HearingApp {
                     .unwrap_or(0);
                 self.setup.volume = system_output_volume_percent();
                 self.setup.audio = None;
+                self.setup.comfortable = false;
             }
             Err(error) => self.error(error),
         }
@@ -347,56 +385,111 @@ impl HearingApp {
 impl HearingApp {
     fn draw(&mut self, root_ui: &mut egui::Ui) {
         let context = root_ui.ctx().clone();
-        egui::Frame::central_panel(root_ui.style()).show(root_ui, |ui| {
-            let mut allow_space = false;
-            ui.horizontal(|ui| {
-                ui.heading("Hearing Tracker");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    allow_space = self.language_selector(ui);
-                    if self.page != Page::Dashboard
-                        && ui.button(self.language.text(Text::Home)).clicked()
-                        && self.running.is_none()
+        egui::Frame::central_panel(root_ui.style())
+            .inner_margin(24)
+            .show(root_ui, |ui| {
+                let mut allow_space = false;
+                ui.horizontal(|ui| {
+                    theme::sound_mark(ui, 36.0);
+                    ui.label(RichText::new("Hearing Tracker").size(22.0).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        allow_space = self.language_selector(ui);
+                    });
+                });
+                let language = self.language;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.running.is_none(),
+                            egui::Button::new(language.text(Text::Overview))
+                                .selected(self.page == Page::Dashboard),
+                        )
+                        .clicked()
                     {
                         self.page = Page::Dashboard;
                     }
-                });
-            });
-            let language = self.language;
-            ui.label(RichText::new(language.text(Text::Subtitle)).color(Color32::DARK_GRAY));
-            ui.separator();
-            let warning: egui::WidgetText = RichText::new(language.text(Text::UrgentWarning))
-                .small()
-                .color(Color32::from_rgb(145, 67, 20))
-                .into();
-            let warning_height = warning
-                .clone()
-                .into_galley(
-                    ui,
-                    Some(egui::TextWrapMode::Wrap),
-                    ui.available_width(),
-                    egui::TextStyle::Small,
-                )
-                .size()
-                .y;
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .max_height((ui.available_height() - warning_height - 24.0).max(0.0))
-                .show(ui, |ui| match self.page {
-                    Page::Dashboard => self.dashboard_ui(ui),
-                    Page::Setup => self.setup_ui(ui),
-                    Page::Test => {
-                        let action = self
-                            .running
-                            .as_mut()
-                            .map(|run| run.ui(ui, &context, language, allow_space))
-                            .unwrap_or(TestAction::None);
-                        self.handle_test_action(action);
+                    if self.page != Page::Dashboard {
+                        let label = match self.page {
+                            Page::Setup => Text::Prepare,
+                            Page::Test => Text::Listen,
+                            Page::Results(_) => Text::Results,
+                            Page::Dashboard => unreachable!(),
+                        };
+                        ui.label(RichText::new("/ ").color(theme::MUTED));
+                        theme::badge(ui, language.text(label), theme::BLUE, theme::BABY_BLUE);
                     }
-                    Page::Results(id) => self.results_ui(ui, id),
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.small(RichText::new(language.text(Text::Subtitle)).color(theme::MUTED));
+                    });
                 });
-            ui.separator();
-            ui.label(warning);
-        });
+                ui.add_space(10.0);
+                let warning: egui::WidgetText = RichText::new(language.text(Text::UrgentWarning))
+                    .small()
+                    .color(theme::AMBER)
+                    .into();
+                let warning_height = warning
+                    .clone()
+                    .into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Wrap),
+                        (ui.available_width() - 24.0).max(1.0),
+                        egui::TextStyle::Small,
+                    )
+                    .size()
+                    .y;
+                let setup_navigation_height = if self.page == Page::Setup {
+                    let duration: egui::WidgetText =
+                        RichText::new(language.text(Text::Duration)).small().into();
+                    duration
+                        .into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Wrap),
+                            ui.available_width(),
+                            egui::TextStyle::Small,
+                        )
+                        .size()
+                        .y
+                        + 74.0
+                } else {
+                    0.0
+                };
+                egui::ScrollArea::vertical()
+                    .id_salt((
+                        "page_content",
+                        self.page,
+                        (self.page == Page::Setup).then_some(self.setup.step),
+                    ))
+                    .auto_shrink([false, false])
+                    .max_height(
+                        (ui.available_height() - warning_height - setup_navigation_height - 40.0)
+                            .max(0.0),
+                    )
+                    .show(ui, |ui| match self.page {
+                        Page::Dashboard => self.dashboard_ui(ui),
+                        Page::Setup => self.setup_ui(ui),
+                        Page::Test => {
+                            let action = self
+                                .running
+                                .as_mut()
+                                .map(|run| run.ui(ui, &context, language, allow_space))
+                                .unwrap_or(TestAction::None);
+                            self.handle_test_action(action);
+                        }
+                        Page::Results(id) => self.results_ui(ui, id),
+                    });
+                if self.page == Page::Setup {
+                    self.setup_navigation(ui);
+                }
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(theme::AMBER_BG)
+                    .corner_radius(10)
+                    .inner_margin(12)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(warning);
+                    });
+            });
 
         let language = self.language;
         if let Some(message) = self.message.clone() {
@@ -413,7 +506,7 @@ impl HearingApp {
                 ui.set_max_width(440.0);
                 ui.label(message.text.render(language));
                 ui.add_space(8.0);
-                if ui.button(language.text(Text::Ok)).clicked() {
+                if ui.add(theme::primary(language.text(Text::Ok))).clicked() {
                     self.message = None;
                 }
             });
@@ -424,78 +517,154 @@ impl HearingApp {
 impl HearingApp {
     fn dashboard_ui(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
-        ui.add_space(12.0);
-        ui.heading(language.text(Text::DashboardHeading));
-        ui.label(language.text(Text::DashboardIntro));
-        ui.add_space(8.0);
-        if ui
-            .add(egui::Button::new(language.text(Text::StartTest)).min_size(Vec2::new(170.0, 42.0)))
-            .clicked()
-        {
-            self.enter_setup();
-        }
-        ui.add_space(18.0);
-        ui.separator();
+        let compact = ui.ctx().content_rect().height() < 700.0;
+        theme::card()
+            .inner_margin(if compact { 14 } else { 20 })
+            .fill(Color32::from_rgb(237, 246, 253))
+            .stroke(Stroke::NONE)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if compact {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                }
+                ui.horizontal(|ui| {
+                    let width = (ui.available_width() - 160.0).max(240.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(width, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            theme::eyebrow(ui, language.text(Text::PersonalCheck));
+                            ui.label(
+                                RichText::new(language.text(Text::DashboardHeading))
+                                    .size(30.0)
+                                    .strong(),
+                            );
+                            theme::muted(ui, language.text(Text::DashboardIntro));
+                            if ui
+                                .add(theme::primary(language.text(Text::StartTest)))
+                                .clicked()
+                            {
+                                self.enter_setup();
+                            }
+                        },
+                    );
+                    theme::sound_mark(ui, 140.0);
+                });
+            });
+        ui.add_space(4.0);
+        ui.columns(3, |columns| {
+            summary_card(
+                &mut columns[0],
+                language.text(Text::CheckTime),
+                language.text(Text::CheckTimeLabel),
+            );
+            summary_card(
+                &mut columns[1],
+                language.text(Text::CheckFrequencies),
+                language.text(Text::CheckFrequenciesLabel),
+            );
+            summary_card(
+                &mut columns[2],
+                language.text(Text::Offline),
+                language.text(Text::OfflineLabel),
+            );
+        });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.heading(language.text(Text::History));
-            ui.label(language.format(Text::SavedSessions, &[self.sessions.len().to_string()]));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                theme::muted(
+                    ui,
+                    language.format(
+                        if self.sessions.len() == 1 {
+                            Text::SavedSession
+                        } else {
+                            Text::SavedSessions
+                        },
+                        &[self.sessions.len().to_string()],
+                    ),
+                );
+            });
         });
         if self.sessions.is_empty() {
-            ui.add_space(24.0);
-            ui.label(language.text(Text::NoTests));
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.strong(language.text(Text::FirstCheck));
+                theme::muted(ui, language.text(Text::NoTests));
+            });
         } else {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("history_grid")
-                    .num_columns(5)
-                    .striped(true)
-                    .spacing([24.0, 10.0])
-                    .show(ui, |ui| {
-                        ui.strong(language.text(Text::Date));
-                        ui.strong(language.text(Text::Status));
-                        ui.strong(language.text(Text::Quality));
-                        ui.strong(language.text(Text::Output));
-                        ui.strong("");
-                        ui.end_row();
-                        let rows: Vec<_> = self
-                            .sessions
-                            .iter()
-                            .map(|session| {
-                                (
-                                    session.id,
-                                    language.date(session.started_at.date()),
-                                    language.status(session.status).to_owned(),
-                                    session
-                                        .quality
-                                        .as_ref()
-                                        .map(|q| language.confidence(q.high_confidence))
-                                        .unwrap_or("--")
-                                        .to_owned(),
-                                    session.setup.device_name.clone(),
-                                )
-                            })
-                            .collect();
-                        for (id, date, status, quality, output) in rows {
-                            ui.label(date);
-                            ui.label(status);
-                            ui.label(quality);
-                            ui.label(output);
+            let rows: Vec<_> = self
+                .sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.id,
+                        language.date(session.started_at.date()),
+                        session.status,
+                        session
+                            .quality
+                            .as_ref()
+                            .map(|quality| quality.high_confidence),
+                        session.setup.device_name.clone(),
+                    )
+                })
+                .collect();
+            for (index, (id, date, status, confidence, device)) in rows.into_iter().enumerate() {
+                theme::card().inner_margin(14).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let detail_width = (ui.available_width() - 180.0).max(200.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(detail_width, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(date).size(17.0).strong());
+                                    if index == 0 {
+                                        theme::eyebrow(ui, language.text(Text::LatestCheck));
+                                    }
+                                    theme::badge(
+                                        ui,
+                                        language.status(status),
+                                        theme::BLUE,
+                                        theme::BABY_BLUE,
+                                    );
+                                    if let Some(high) = confidence {
+                                        theme::badge(
+                                            ui,
+                                            language.confidence(high),
+                                            if high { theme::GREEN } else { theme::AMBER },
+                                            if high {
+                                                theme::GREEN_BG
+                                            } else {
+                                                theme::AMBER_BG
+                                            },
+                                        );
+                                    }
+                                });
+                                theme::muted(ui, device);
+                            },
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button(language.text(Text::View)).clicked() {
                                 self.page = Page::Results(id);
                             }
-                            ui.end_row();
-                        }
+                        });
                     });
-            });
+                });
+            }
         }
-        ui.add_space(16.0);
-        ui.separator();
-        egui::CollapsingHeader::new(language.text(Text::LocalData))
-            .id_salt("local_data")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        theme::muted(ui, language.text(Text::PersonalOnly));
+        theme::card().inner_margin(14).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::CollapsingHeader::new(language.text(Text::LocalData))
+                .id_salt("local_data")
+                .show(ui, |ui| {
                     ui.label(language.text(Text::ReportName));
-                    let response = ui.text_edit_singleline(&mut self.display_name);
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.display_name).desired_width(300.0),
+                    );
                     if response.lost_focus()
                         && let Some(repository) = &self.repository
                         && let Err(error) =
@@ -503,136 +672,231 @@ impl HearingApp {
                     {
                         self.error(error);
                     }
+                    if let Some(repository) = &self.repository {
+                        ui.small(language.format(
+                            Text::DatabasePath,
+                            &[repository.path().display().to_string()],
+                        ));
+                    }
+                    ui.small(language.text(Text::Privacy));
                 });
-                if let Some(repository) = &self.repository {
-                    ui.small(language.format(
-                        Text::DatabasePath,
-                        &[repository.path().display().to_string()],
-                    ));
-                }
-                ui.small(language.text(Text::Privacy));
-            });
+        });
     }
 
     fn setup_ui(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
-        ui.add_space(10.0);
         ui.heading(language.text(Text::SetupHeading));
-        ui.label(language.text(Text::SetupIntro));
-        ui.add_space(10.0);
-
-        ui.group(|ui| {
-            ui.strong(language.text(Text::OutputStep));
-            ui.horizontal(|ui| {
-                let selected_name = self
-                    .setup
-                    .devices
-                    .get(self.setup.selected_device)
-                    .map(|device| device.name.as_str())
-                    .unwrap_or(language.text(Text::NoOutput));
-                egui::ComboBox::from_id_salt("output_device")
-                    .selected_text(selected_name)
-                    .show_ui(ui, |ui| {
-                        for (index, device) in self.setup.devices.iter().enumerate() {
-                            if ui
-                                .selectable_value(
-                                    &mut self.setup.selected_device,
-                                    index,
-                                    &device.name,
-                                )
-                                .changed()
-                            {
-                                self.setup.audio = None;
-                                self.setup.comfortable = false;
-                            }
-                        }
-                    });
-                if ui.button(language.text(Text::Refresh)).clicked() {
-                    self.load_devices();
-                }
-            });
-            if let Some(device) = self.setup.devices.get(self.setup.selected_device) {
-                ui.small(language.format(
-                    Text::DeviceDetails,
-                    &[
-                        device.sample_rate.to_string(),
-                        device.channels.to_string(),
-                        device.backend.clone(),
-                    ],
-                ));
-            }
-            ui.label(match self.setup.volume {
-                Some(volume) => language.format(Text::CurrentVolume, &[language.number(volume, 0)]),
-                None => language.text(Text::VolumeUnknown).to_owned(),
-            });
-        });
-        ui.add_space(8.0);
-
-        ui.group(|ui| {
-            ui.strong(language.text(Text::ChecklistStep));
-            ui.checkbox(&mut self.setup.quiet_room, language.text(Text::QuietRoom));
-            ui.checkbox(
-                &mut self.setup.noise_cancellation,
-                language.text(Text::CancellationOn),
-            );
-            ui.checkbox(
-                &mut self.setup.processing_off,
-                language.text(Text::ProcessingOff),
-            );
-        });
-        ui.add_space(8.0);
-
-        ui.group(|ui| {
-            ui.strong(language.text(Text::ReferenceStep));
-            ui.label(language.text(Text::ReferenceHelp));
-            ui.horizontal(|ui| {
-                if ui.button(language.text(Text::PlayLeft)).clicked() {
-                    self.play_setup_tone(Ear::Left);
-                }
-                if ui.button(language.text(Text::PlayRight)).clicked() {
-                    self.play_setup_tone(Ear::Right);
-                }
-            });
-            ui.checkbox(
-                &mut self.setup.comfortable,
-                language.text(Text::ReferenceComfort),
-            );
-        });
-        ui.add_space(8.0);
-
-        ui.group(|ui| {
-            ui.strong(language.text(Text::EarOrderStep));
-            ui.label(language.text(Text::EarOrderHelp));
-            ui.horizontal(|ui| {
-                ui.radio_value(
-                    &mut self.setup.first_ear,
-                    Ear::Right,
-                    language.text(Text::RightFirst),
-                );
-                ui.radio_value(
-                    &mut self.setup.first_ear,
-                    Ear::Left,
-                    language.text(Text::LeftFirst),
-                );
-            });
-        });
-        ui.add_space(14.0);
-
-        let ready = !self.setup.devices.is_empty()
-            && self.setup.quiet_room
-            && self.setup.noise_cancellation
-            && self.setup.processing_off
-            && self.setup.comfortable;
-        if ui
-            .add_enabled(
-                ready,
-                egui::Button::new(RichText::new(language.text(Text::BeginTest)).size(17.0)),
-            )
-            .clicked()
-        {
-            self.start_test();
+        let compact = ui.ctx().content_rect().height() < 700.0;
+        if !compact {
+            theme::muted(ui, language.text(Text::SetupIntro));
         }
-        ui.label(language.text(Text::Duration));
+        ui.add_space(4.0);
+        ui.columns(4, |columns| {
+            for (index, (column, label)) in columns
+                .iter_mut()
+                .zip([Text::Headphones, Text::Room, Text::Sound, Text::Ready])
+                .enumerate()
+            {
+                let current = self.setup.step.index();
+                let fill = if index <= current {
+                    theme::BABY_BLUE
+                } else {
+                    Color32::WHITE
+                };
+                let color = if index <= current {
+                    theme::BLUE
+                } else {
+                    theme::MUTED
+                };
+                egui::Frame::new()
+                    .fill(fill)
+                    .stroke(Stroke::new(
+                        if index == current { 1.5 } else { 0.0 },
+                        theme::BLUE,
+                    ))
+                    .corner_radius(10)
+                    .inner_margin(10)
+                    .show(column, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(format!("{}. {}", index + 1, language.text(label)))
+                                .size(13.0)
+                                .strong()
+                                .color(color),
+                        );
+                    });
+            }
+        });
+        ui.add_space(8.0);
+        theme::card()
+            .inner_margin(if compact { 14 } else { 20 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if compact {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                }
+                theme::eyebrow(
+                    ui,
+                    &language.format(
+                        Text::StepCount,
+                        &[(self.setup.step.index() + 1).to_string()],
+                    ),
+                );
+                match self.setup.step {
+                    SetupStep::Device => {
+                        ui.heading(language.text(Text::OutputStep));
+                        theme::muted(ui, language.text(Text::ChooseHeadphonesHelp));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let selected_name = self
+                                .setup
+                                .devices
+                                .get(self.setup.selected_device)
+                                .map(|device| device.name.as_str())
+                                .unwrap_or(language.text(Text::NoOutput));
+                            egui::ComboBox::from_id_salt("output_device")
+                                .width((ui.available_width() - 150.0).min(460.0))
+                                .selected_text(selected_name)
+                                .show_ui(ui, |ui| {
+                                    ui.set_max_width(480.0);
+                                    for (index, device) in self.setup.devices.iter().enumerate() {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.setup.selected_device,
+                                                index,
+                                                &device.name,
+                                            )
+                                            .changed()
+                                        {
+                                            self.setup.audio = None;
+                                            self.setup.comfortable = false;
+                                        }
+                                    }
+                                });
+                            if ui.button(language.text(Text::Refresh)).clicked() {
+                                self.load_devices();
+                            }
+                        });
+                        if self.setup.devices.is_empty() {
+                            theme::muted(ui, language.text(Text::NoHeadphonesHelp));
+                        }
+                        if let Some(device) = self.setup.devices.get(self.setup.selected_device) {
+                            ui.small(
+                                RichText::new(language.format(
+                                    Text::DeviceDetails,
+                                    &[
+                                        device.sample_rate.to_string(),
+                                        device.channels.to_string(),
+                                        device.backend.clone(),
+                                    ],
+                                ))
+                                .color(theme::MUTED),
+                            );
+                        }
+                        ui.label(match self.setup.volume {
+                            Some(volume) => {
+                                language.format(Text::CurrentVolume, &[language.number(volume, 0)])
+                            }
+                            None => language.text(Text::VolumeUnknown).to_owned(),
+                        });
+                    }
+                    SetupStep::Room => {
+                        ui.heading(language.text(Text::ChecklistStep));
+                        theme::muted(ui, language.text(Text::RoomHelp));
+                        ui.add_space(6.0);
+                        ui.checkbox(&mut self.setup.quiet_room, language.text(Text::QuietRoom));
+                        ui.checkbox(
+                            &mut self.setup.noise_cancellation,
+                            language.text(Text::CancellationOn),
+                        );
+                        ui.checkbox(
+                            &mut self.setup.processing_off,
+                            language.text(Text::ProcessingOff),
+                        );
+                    }
+                    SetupStep::Sound => {
+                        ui.heading(language.text(Text::ReferenceStep));
+                        theme::muted(ui, language.text(Text::ReferenceHelp));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(language.text(Text::PlayLeft)).clicked() {
+                                self.play_setup_tone(Ear::Left);
+                            }
+                            if ui.button(language.text(Text::PlayRight)).clicked() {
+                                self.play_setup_tone(Ear::Right);
+                            }
+                        });
+                        ui.checkbox(
+                            &mut self.setup.comfortable,
+                            language.text(Text::ReferenceComfort),
+                        );
+                    }
+                    SetupStep::Ready => {
+                        ui.heading(language.text(Text::EarOrderStep));
+                        theme::badge(
+                            ui,
+                            language.text(Text::ReadySummary),
+                            theme::GREEN,
+                            theme::GREEN_BG,
+                        );
+                        if let Some(device) = self.setup.devices.get(self.setup.selected_device) {
+                            theme::muted(ui, &device.name);
+                        }
+                        ui.add_space(6.0);
+                        ui.strong(language.text(Text::FirstEar));
+                        theme::muted(ui, language.text(Text::EarOrderHelp));
+                        ui.horizontal(|ui| {
+                            ui.radio_value(
+                                &mut self.setup.first_ear,
+                                Ear::Right,
+                                language.text(Text::RightFirst),
+                            );
+                            ui.radio_value(
+                                &mut self.setup.first_ear,
+                                Ear::Left,
+                                language.text(Text::LeftFirst),
+                            );
+                        });
+                    }
+                }
+                if !self.setup.can_continue() {
+                    ui.small(RichText::new(language.text(Text::FinishSetup)).color(theme::MUTED));
+                }
+            });
+    }
+
+    // Keep navigation reachable even when translated instructions need scrolling.
+    fn setup_navigation(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.horizontal(|ui| {
+            if self.setup.step != SetupStep::Device
+                && ui.button(language.text(Text::Back)).clicked()
+            {
+                self.setup.step = SetupStep::ALL[self.setup.step.index() - 1];
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.setup.step == SetupStep::Ready {
+                    if ui
+                        .add_enabled(
+                            self.setup.ready(),
+                            theme::primary(language.text(Text::BeginTest)),
+                        )
+                        .clicked()
+                    {
+                        self.start_test();
+                    }
+                } else if ui
+                    .add_enabled(
+                        self.setup.can_continue(),
+                        theme::primary(language.text(Text::Continue)),
+                    )
+                    .clicked()
+                {
+                    self.setup.step = SetupStep::ALL[self.setup.step.index() + 1];
+                }
+            });
+        });
+        ui.small(RichText::new(language.text(Text::Duration)).color(theme::MUTED));
     }
 
     fn results_ui(&mut self, ui: &mut egui::Ui, id: Uuid) {
@@ -655,7 +919,9 @@ impl HearingApp {
             ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if session.status == SessionStatus::Completed
-                    && ui.button(language.text(Text::ExportPdf)).clicked()
+                    && ui
+                        .add(theme::primary(language.text(Text::ExportPdf)))
+                        .clicked()
                 {
                     let suggested = format!("hearing-report-{}.pdf", session.started_at.date());
                     if let Some(path) = rfd::FileDialog::new()
@@ -681,69 +947,95 @@ impl HearingApp {
                 }
             });
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(language.format(
-                Text::StatusValue,
-                &[language.status(session.status).to_owned()],
-            ));
-            ui.separator();
-            ui.label(language.format(
-                Text::OutputValue,
-                std::slice::from_ref(&session.setup.device_name),
-            ));
-            ui.separator();
-            ui.label(
-                language.format(
-                    Text::VolumeValue,
-                    &[session
-                        .setup
-                        .sink_volume_percent
-                        .map(|value| format!("{}%", language.number(value, 0)))
-                        .unwrap_or_else(|| language.text(Text::Unavailable).into())],
-                ),
-            );
-            if let Some(quality) = &session.quality {
-                ui.separator();
-                ui.label(
-                    RichText::new(language.confidence(quality.high_confidence)).color(
+        theme::card().inner_margin(14).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                theme::badge(
+                    ui,
+                    language.status(session.status),
+                    theme::BLUE,
+                    theme::BABY_BLUE,
+                );
+                if let Some(quality) = &session.quality {
+                    theme::badge(
+                        ui,
+                        language.confidence(quality.high_confidence),
                         if quality.high_confidence {
-                            Color32::DARK_GREEN
+                            theme::GREEN
                         } else {
-                            Color32::DARK_RED
+                            theme::AMBER
                         },
+                        if quality.high_confidence {
+                            theme::GREEN_BG
+                        } else {
+                            theme::AMBER_BG
+                        },
+                    );
+                }
+                theme::muted(ui, &session.setup.device_name);
+                theme::muted(
+                    ui,
+                    language.format(
+                        Text::VolumeValue,
+                        &[session
+                            .setup
+                            .sink_volume_percent
+                            .map(|value| format!("{}%", language.number(value, 0)))
+                            .unwrap_or_else(|| language.text(Text::Unavailable).into())],
                     ),
                 );
-            }
-        });
-        if let Some(quality) = &session.quality {
-            for reason in &quality.reasons {
-                ui.label(
-                    RichText::new(format!("• {}", language.quality_reason(reason)))
-                        .color(Color32::DARK_RED),
-                );
-            }
-        }
-        ui.add_space(8.0);
-        audiogram(ui, &session, baseline.as_ref(), language);
-        ui.add_space(8.0);
-        threshold_table(ui, &session, baseline.as_ref(), language);
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            if session
-                .quality
-                .as_ref()
-                .is_some_and(|quality| quality.high_confidence)
-                && ui.button(language.text(Text::UseBaseline)).clicked()
-                && let Some(repository) = &self.repository
-            {
-                match repository.set_baseline(&session) {
-                    Ok(()) => self.info(Text::BaselineUpdated),
-                    Err(error) => self.error(error),
+            });
+            if let Some(quality) = &session.quality {
+                for reason in &quality.reasons {
+                    ui.label(
+                        RichText::new(format!("• {}", language.quality_reason(reason)))
+                            .color(theme::AMBER),
+                    );
                 }
             }
-            if ui.button(language.text(Text::DeleteSession)).clicked() {
-                self.delete_confirmation = Some(id);
+        });
+        theme::card().inner_margin(16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.heading(language.text(Text::HearingChart));
+            chart_legend(ui, baseline.is_some(), language);
+            audiogram(ui, &session, baseline.as_ref(), language);
+        });
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::CollapsingHeader::new(language.text(Text::DetailedValues))
+                .id_salt(("detailed_values", id))
+                .show(ui, |ui| {
+                    threshold_table(ui, &session, language);
+                });
+            if baseline.is_none() {
+                ui.small(RichText::new(language.text(Text::NoBaseline)).color(theme::MUTED));
             }
+            ui.small(RichText::new(language.text(Text::RelativeScale)).color(theme::MUTED));
+        });
+        theme::card().inner_margin(14).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(language.text(Text::SessionActions));
+            ui.horizontal_wrapped(|ui| {
+                if session
+                    .quality
+                    .as_ref()
+                    .is_some_and(|quality| quality.high_confidence)
+                    && ui.button(language.text(Text::UseBaseline)).clicked()
+                    && let Some(repository) = &self.repository
+                {
+                    match repository.set_baseline(&session) {
+                        Ok(()) => self.info(Text::BaselineUpdated),
+                        Err(error) => self.error(error),
+                    }
+                }
+                if ui
+                    .button(RichText::new(language.text(Text::DeleteSession)).color(theme::RED))
+                    .clicked()
+                {
+                    self.delete_confirmation = Some(id);
+                }
+            });
         });
 
         if self.delete_confirmation == Some(id) {
@@ -1018,6 +1310,15 @@ struct TestControls {
     abandon: bool,
 }
 
+fn summary_card(ui: &mut egui::Ui, value: &str, label: &str) {
+    theme::card().inner_margin(10).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.label(RichText::new(value).size(17.0).strong().color(theme::BLUE));
+        ui.small(RichText::new(label).color(theme::MUTED));
+    });
+}
+
 fn test_controls(
     ui: &mut egui::Ui,
     context: &egui::Context,
@@ -1028,39 +1329,110 @@ fn test_controls(
     paused: bool,
 ) -> TestControls {
     let mut controls = TestControls::default();
-    ui.vertical_centered(|ui| {
-        ui.add_space(45.0);
-        ui.heading(language.text(Text::ListenHeading));
-        ui.label(language.text(Text::ListenHelp));
-        ui.add_space(20.0);
-        ui.add(egui::ProgressBar::new(progress).desired_width(500.0));
-        ui.label(language.format(Text::Progress, &[language.number(progress * 100.0, 0)]));
-        ui.add_space(45.0);
-        controls.heard = ui
-            .add_sized(
-                [ui.available_width().min(520.0), 120.0],
-                egui::Button::new(RichText::new(language.text(Text::HearIt)).size(24.0)),
-            )
-            .clicked();
-    });
-    controls.heard |= allow_space && context.input(|input| input.key_pressed(egui::Key::Space));
-    if let Some(warning) = warning {
-        ui.add_space(20.0);
-        ui.vertical_centered(|ui| {
-            ui.label(RichText::new(warning.render(language)).color(Color32::DARK_RED));
-            ui.label(language.text(Text::RestoreSetup));
-        });
-    }
-    ui.add_space(30.0);
-    ui.horizontal(|ui| {
+    let compact = context.content_rect().height() < 700.0;
+    ui.horizontal_wrapped(|ui| {
         if paused {
-            controls.resume = ui.button(language.text(Text::Resume)).clicked();
+            controls.resume = ui
+                .add(theme::primary(language.text(Text::Resume)))
+                .clicked();
         } else {
             controls.pause = ui.button(language.text(Text::Pause)).clicked();
         }
-        controls.abandon = ui.button(language.text(Text::Abandon)).clicked();
+        controls.abandon = ui
+            .button(RichText::new(language.text(Text::Abandon)).color(theme::MUTED))
+            .clicked();
     });
+    theme::card()
+        .inner_margin(if compact { 14 } else { 20 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if compact {
+                ui.spacing_mut().item_spacing.y = 8.0;
+            }
+            ui.vertical_centered(|ui| {
+                theme::eyebrow(ui, language.text(Text::ListeningCheck));
+                theme::sound_mark(ui, if compact { 48.0 } else { 76.0 });
+                ui.heading(language.text(if paused {
+                    Text::PausedHeading
+                } else {
+                    Text::ListenHeading
+                }));
+                theme::muted(
+                    ui,
+                    language.text(if paused {
+                        Text::PausedHelp
+                    } else {
+                        Text::ListenHelp
+                    }),
+                );
+                ui.add_space(6.0);
+                let width = ui.available_width().min(520.0);
+                ui.scope(|ui| {
+                    ui.visuals_mut().extreme_bg_color = theme::BABY_BLUE;
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(width)
+                            .desired_height(8.0)
+                            .fill(theme::BLUE),
+                    );
+                });
+                ui.small(
+                    RichText::new(
+                        language.format(Text::Progress, &[language.number(progress * 100.0, 0)]),
+                    )
+                    .color(theme::MUTED),
+                );
+                ui.add_space(8.0);
+                controls.heard = ui
+                    .add_enabled(
+                        !paused,
+                        theme::primary_text(RichText::new(language.text(Text::HearIt)).size(22.0))
+                            .min_size(Vec2::new(width, 82.0)),
+                    )
+                    .clicked();
+                ui.small(RichText::new(language.text(Text::ListeningDuration)).color(theme::MUTED));
+            });
+        });
+    controls.heard |=
+        !paused && allow_space && context.input(|input| input.key_pressed(egui::Key::Space));
+    if let Some(warning) = warning {
+        egui::Frame::new()
+            .fill(theme::AMBER_BG)
+            .corner_radius(12)
+            .inner_margin(14)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(warning.render(language)).color(theme::AMBER));
+                theme::muted(ui, language.text(Text::RestoreSetup));
+            });
+    }
+
     controls
+}
+
+fn chart_legend(ui: &mut egui::Ui, has_baseline: bool, language: Language) {
+    ui.horizontal_wrapped(|ui| {
+        theme::badge(
+            ui,
+            language.text(Text::RightLegend),
+            theme::RED,
+            Color32::from_rgb(252, 237, 239),
+        );
+        theme::badge(
+            ui,
+            language.text(Text::LeftLegend),
+            theme::BLUE,
+            theme::BABY_BLUE,
+        );
+        if has_baseline {
+            theme::badge(
+                ui,
+                language.text(Text::BaselineLegend),
+                theme::MUTED,
+                theme::BACKGROUND,
+            );
+        }
+    });
 }
 
 fn audiogram(
@@ -1069,24 +1441,20 @@ fn audiogram(
     baseline: Option<&TestSession>,
     language: Language,
 ) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 350.0), Sense::hover());
+    let height = (ui.ctx().content_rect().height() * 0.34).clamp(220.0, 320.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 6.0, Color32::from_rgb(250, 251, 252));
+    painter.rect_filled(rect, 12.0, theme::BACKGROUND);
     let plot = Rect::from_min_max(
         Pos2::new(rect.left() + 62.0, rect.top() + 38.0),
         Pos2::new(rect.right() - 30.0, rect.bottom() - 38.0),
     );
-    painter.rect_stroke(
-        plot,
-        0.0,
-        Stroke::new(1.0, Color32::GRAY),
-        StrokeKind::Inside,
-    );
+    painter.rect_stroke(plot, 0.0, Stroke::new(1.0, theme::LINE), StrokeKind::Inside);
     for (index, frequency) in FREQUENCIES_HZ.into_iter().enumerate() {
         let x = plot.left() + index as f32 * plot.width() / 7.0;
         painter.line_segment(
             [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
-            Stroke::new(0.6, Color32::LIGHT_GRAY),
+            Stroke::new(0.8, theme::LINE),
         );
         painter.text(
             Pos2::new(x, plot.top() - 12.0),
@@ -1097,21 +1465,21 @@ fn audiogram(
                 frequency.to_string()
             },
             FontId::proportional(12.0),
-            Color32::DARK_GRAY,
+            theme::MUTED,
         );
     }
     for level in (0..=60).step_by(10) {
         let y = plot.top() + level as f32 / 60.0 * plot.height();
         painter.line_segment(
             [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
-            Stroke::new(0.6, Color32::LIGHT_GRAY),
+            Stroke::new(0.8, theme::LINE),
         );
         painter.text(
             Pos2::new(plot.left() - 18.0, y),
             Align2::CENTER_CENTER,
             level,
             FontId::proportional(12.0),
-            Color32::DARK_GRAY,
+            theme::MUTED,
         );
     }
     painter.text(
@@ -1119,7 +1487,7 @@ fn audiogram(
         Align2::CENTER_CENTER,
         "dB-R",
         FontId::proportional(12.0),
-        Color32::DARK_GRAY,
+        theme::MUTED,
     );
     if let Some(baseline) = baseline {
         draw_screen_curves(&painter, plot, baseline, true, language);
@@ -1139,9 +1507,9 @@ fn draw_screen_curves(
         let colour = if baseline {
             Color32::GRAY
         } else if ear == Ear::Right {
-            Color32::from_rgb(205, 35, 45)
+            theme::RED
         } else {
-            Color32::from_rgb(30, 80, 200)
+            theme::BLUE
         };
         let points: Vec<_> = FREQUENCIES_HZ
             .into_iter()
@@ -1220,27 +1588,7 @@ fn dashed_line(painter: &egui::Painter, start: Pos2, end: Pos2, stroke: Stroke) 
     }
 }
 
-fn threshold_table(
-    ui: &mut egui::Ui,
-    session: &TestSession,
-    baseline: Option<&TestSession>,
-    language: Language,
-) {
-    ui.horizontal_wrapped(|ui| {
-        ui.colored_label(
-            Color32::from_rgb(205, 35, 45),
-            language.text(Text::RightLegend),
-        );
-        ui.colored_label(
-            Color32::from_rgb(30, 80, 200),
-            language.text(Text::LeftLegend),
-        );
-        if baseline.is_some() {
-            ui.colored_label(Color32::GRAY, language.text(Text::BaselineLegend));
-        } else {
-            ui.label(language.text(Text::NoBaseline));
-        }
-    });
+fn threshold_table(ui: &mut egui::Ui, session: &TestSession, language: Language) {
     egui::Grid::new("threshold_table")
         .striped(true)
         .spacing([22.0, 6.0])
@@ -1272,7 +1620,6 @@ fn threshold_table(
             }
         });
     ui.small(language.text(Text::NoResponseHelp));
-    ui.small(language.text(Text::RelativeScale));
 }
 
 fn screen_threshold(session: &TestSession, ear: Ear, frequency: u32) -> Option<f32> {
@@ -1377,13 +1724,17 @@ mod tests {
     }
 
     fn visible_text(shapes: &[ClippedShape]) -> String {
+        visible_text_at_width(shapes, 850.0)
+    }
+
+    fn visible_text_at_width(shapes: &[ClippedShape], width: f32) -> String {
         let mut values = Vec::new();
         for shape in shapes {
             visit_text(&shape.shape, &mut |text| {
                 let bounds = text.galley.rect.translate(text.pos.to_vec2());
                 if bounds.intersects(shape.clip_rect) {
                     assert!(
-                        bounds.min.x >= -1.0 && bounds.max.x <= 851.0,
+                        bounds.min.x >= -1.0 && bounds.max.x <= width + 1.0,
                         "text exceeds minimum window width: {} at {bounds:?}",
                         text.galley.job.text
                     );
@@ -1405,9 +1756,11 @@ mod tests {
         app.setup.processing_off = true;
         app.setup.comfortable = true;
         app.setup.first_ear = Ear::Left;
+        app.setup.step = SetupStep::Sound;
         let original = serde_json::to_string(&app.sessions).unwrap();
         app.set_language(Language::German);
         assert_eq!(app.page, Page::Setup);
+        assert_eq!(app.setup.step, SetupStep::Sound);
         assert!(
             app.setup.quiet_room
                 && app.setup.noise_cancellation
@@ -1452,86 +1805,117 @@ mod tests {
     }
 
     #[test]
-    fn minimum_window_renders_all_pages_and_translated_dialogs() {
-        for language in [Language::English, Language::German] {
-            for page in [
-                "dashboard",
-                "setup",
-                "setup-end",
-                "results",
-                "results-end",
-                "message",
-                "delete",
-            ] {
-                let mut app = sample_app(None);
-                app.language = language;
-                app.setup.devices.push(AudioDeviceInfo {
-                    id: "test".into(),
-                    name: "AirPods Pro".into(),
-                    backend: "ALSA".into(),
-                    sample_rate: 48_000,
-                    channels: 2,
-                });
-                app.setup.volume = Some(50.0);
-                app.page = match page {
-                    "setup" | "setup-end" => Page::Setup,
-                    "results" | "results-end" | "delete" => Page::Results(app.sessions[0].id),
-                    _ => Page::Dashboard,
-                };
-                if page == "message" {
-                    app.info(Text::BaselineUpdated);
-                }
-                if page == "delete" {
-                    app.delete_confirmation = Some(app.sessions[0].id);
-                }
-                let context = egui::Context::default();
-                context.set_theme(egui::Theme::Light);
-                context.style_mut_of(egui::Theme::Light, |style| {
-                    style.spacing.button_padding = Vec2::new(14.0, 8.0)
-                });
-                let mut deltas = Vec::new();
-                let mut output = None;
-                for pass in 0..5 {
-                    let mut raw = input();
-                    raw.time = Some(pass as f64 * 0.25);
-                    if page.ends_with("-end") && pass > 1 {
-                        raw.events = vec![
-                            egui::Event::PointerMoved(Pos2::new(400.0, 300.0)),
-                            egui::Event::MouseWheel {
-                                unit: egui::MouseWheelUnit::Point,
-                                phase: egui::TouchPhase::Move,
-                                delta: Vec2::new(0.0, -800.0),
-                                modifiers: egui::Modifiers::NONE,
-                            },
-                        ];
+    fn desktop_windows_render_all_pages_and_translated_dialogs() {
+        for size in [Vec2::new(850.0, 620.0), Vec2::new(1050.0, 760.0)] {
+            for language in [Language::English, Language::German] {
+                for page in [
+                    "dashboard",
+                    "empty-dashboard",
+                    "setup",
+                    "setup-room",
+                    "setup-sound",
+                    "setup-ready",
+                    "setup-end",
+                    "results",
+                    "results-end",
+                    "message",
+                    "delete",
+                ] {
+                    let mut app = sample_app(None);
+                    app.language = language;
+                    app.setup.devices.push(AudioDeviceInfo {
+                        id: "test".into(),
+                        name: "AirPods Pro".into(),
+                        backend: "ALSA".into(),
+                        sample_rate: 48_000,
+                        channels: 2,
+                    });
+                    app.setup.volume = Some(50.0);
+                    app.page = match page {
+                        "setup" | "setup-room" | "setup-sound" | "setup-ready" | "setup-end" => {
+                            Page::Setup
+                        }
+                        "results" | "results-end" | "delete" => Page::Results(app.sessions[0].id),
+                        _ => Page::Dashboard,
+                    };
+                    if page == "empty-dashboard" {
+                        app.sessions.clear();
                     }
-                    let frame = context.run_ui(raw, |ui| app.draw(ui));
-                    deltas.extend(frame.textures_delta.set.clone());
-                    output = Some(frame);
+                    app.setup.step = match page {
+                        "setup-room" => SetupStep::Room,
+                        "setup-sound" => SetupStep::Sound,
+                        "setup-ready" | "setup-end" => SetupStep::Ready,
+                        _ => SetupStep::Device,
+                    };
+                    if matches!(app.setup.step, SetupStep::Ready) {
+                        app.setup.quiet_room = true;
+                        app.setup.noise_cancellation = true;
+                        app.setup.processing_off = true;
+                        app.setup.comfortable = true;
+                    }
+                    if page == "message" {
+                        app.info(Text::BaselineUpdated);
+                    }
+                    if page == "delete" {
+                        app.delete_confirmation = Some(app.sessions[0].id);
+                    }
+                    let context = egui::Context::default();
+                    theme::configure(&context);
+
+                    let mut deltas = Vec::new();
+                    let mut output = None;
+                    for pass in 0..5 {
+                        let mut raw = input();
+                        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+                        raw.time = Some(pass as f64 * 0.25);
+                        if page.ends_with("-end") && pass > 1 {
+                            raw.events = vec![
+                                egui::Event::PointerMoved(Pos2::new(400.0, 300.0)),
+                                egui::Event::MouseWheel {
+                                    unit: egui::MouseWheelUnit::Point,
+                                    phase: egui::TouchPhase::Move,
+                                    delta: Vec2::new(0.0, -800.0),
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ];
+                        }
+                        let frame = context.run_ui(raw, |ui| app.draw(ui));
+                        deltas.extend(frame.textures_delta.set.clone());
+                        output = Some(frame);
+                    }
+                    let output = output.unwrap();
+                    let text = visible_text_at_width(&output.shapes, size.x);
+                    assert!(text.contains(language.name()));
+                    assert!(
+                        text.contains(language.text(Text::UrgentWarning)),
+                        "footer not visible: {text}"
+                    );
+                    match page {
+                        "dashboard" => assert!(text.contains(language.text(Text::History))),
+                        "setup" | "setup-room" | "setup-sound" | "setup-ready" => {
+                            assert!(text.contains(language.text(Text::SetupHeading)))
+                        }
+                        "empty-dashboard" => {
+                            assert!(text.contains(language.text(Text::FirstCheck)))
+                        }
+                        "setup-end" => assert!(text.contains(language.text(Text::Duration))),
+                        "results-end" => assert!(text.contains(language.text(Text::RelativeScale))),
+                        "results" => assert!(text.contains(language.text(Text::HighConfidence))),
+                        "message" => assert!(text.contains(language.text(Text::BaselineUpdated))),
+                        "delete" => assert!(text.contains(language.text(Text::DeleteQuestion))),
+                        _ => unreachable!(),
+                    }
+                    export_preview(
+                        &context,
+                        &output,
+                        deltas,
+                        &format!(
+                            "{page}{}-{}",
+                            if size.x > 850.0 { "-default" } else { "" },
+                            language.code()
+                        ),
+                    );
                 }
-                let output = output.unwrap();
-                let text = visible_text(&output.shapes);
-                assert!(text.contains(language.name()));
-                assert!(
-                    text.contains(language.text(Text::UrgentWarning)),
-                    "footer not visible: {text}"
-                );
-                match page {
-                    "dashboard" => assert!(text.contains(language.text(Text::History))),
-                    "setup" => assert!(text.contains(language.text(Text::SetupHeading))),
-                    "setup-end" => assert!(text.contains(language.text(Text::Duration))),
-                    "results-end" => assert!(text.contains(language.text(Text::RelativeScale))),
-                    "results" => assert!(text.contains(language.text(Text::HighConfidence))),
-                    "message" => assert!(text.contains(language.text(Text::BaselineUpdated))),
-                    "delete" => assert!(text.contains(language.text(Text::DeleteQuestion))),
-                    _ => unreachable!(),
-                }
-                export_preview(
-                    &context,
-                    &output,
-                    deltas,
-                    &format!("{page}-{}", language.code()),
-                );
             }
         }
     }
@@ -1545,7 +1929,12 @@ mod tests {
                 }
             });
         }
-        center.unwrap_or_else(|| panic!("missing UI text: {value}"))
+        center.unwrap_or_else(|| {
+            panic!(
+                "missing UI text: {value}; visible: {}",
+                visible_text(&output.shapes)
+            )
+        })
     }
 
     fn click(app: &mut HearingApp, context: &egui::Context, position: Pos2) -> egui::FullOutput {
@@ -1567,6 +1956,142 @@ mod tests {
     }
 
     #[test]
+    fn guided_setup_requires_confirmations_and_preserves_them_when_going_back() {
+        for language in [Language::English, Language::German] {
+            let mut app = sample_app(None);
+            app.language = language;
+            app.page = Page::Setup;
+            let context = egui::Context::default();
+            theme::configure(&context);
+            let render = |app: &mut HearingApp| {
+                let _ = context.run_ui(input(), |ui| app.draw(ui));
+                context.run_ui(input(), |ui| app.draw(ui))
+            };
+            let output = render(&mut app);
+            click(
+                &mut app,
+                &context,
+                text_center(&output, language.text(Text::Continue)),
+            );
+            assert_eq!(app.setup.step, SetupStep::Device);
+
+            app.setup.devices.push(AudioDeviceInfo {
+                id: "test".into(),
+                name: "AirPods Pro".into(),
+                backend: "ALSA".into(),
+                sample_rate: 48_000,
+                channels: 2,
+            });
+            let output = render(&mut app);
+            click(
+                &mut app,
+                &context,
+                text_center(&output, language.text(Text::Continue)),
+            );
+            assert_eq!(app.setup.step, SetupStep::Room);
+
+            for (label, should_advance) in [
+                (Text::QuietRoom, false),
+                (Text::CancellationOn, false),
+                (Text::ProcessingOff, true),
+            ] {
+                let output = render(&mut app);
+                click(
+                    &mut app,
+                    &context,
+                    text_center(&output, language.text(label)),
+                );
+                let output = render(&mut app);
+                click(
+                    &mut app,
+                    &context,
+                    text_center(&output, language.text(Text::Continue)),
+                );
+                assert_eq!(
+                    app.setup.step,
+                    if should_advance {
+                        SetupStep::Sound
+                    } else {
+                        SetupStep::Room
+                    }
+                );
+            }
+
+            let output = render(&mut app);
+            click(
+                &mut app,
+                &context,
+                text_center(&output, language.text(Text::Continue)),
+            );
+            assert_eq!(app.setup.step, SetupStep::Sound);
+            let output = render(&mut app);
+            click(
+                &mut app,
+                &context,
+                text_center(&output, language.text(Text::ReferenceComfort)),
+            );
+            let output = render(&mut app);
+            click(
+                &mut app,
+                &context,
+                text_center(&output, language.text(Text::Continue)),
+            );
+            assert_eq!(app.setup.step, SetupStep::Ready);
+            assert!(app.setup.ready());
+
+            let output = render(&mut app);
+            click(
+                &mut app,
+                &context,
+                text_center(&output, language.text(Text::LeftFirst)),
+            );
+            let output = render(&mut app);
+            click(
+                &mut app,
+                &context,
+                text_center(&output, language.text(Text::Back)),
+            );
+            assert_eq!(app.setup.step, SetupStep::Sound);
+            assert!(app.setup.ready());
+            assert_eq!(app.setup.first_ear, Ear::Left);
+
+            // Changing the reference confirmation prevents advancing again.
+            let output = render(&mut app);
+            click(
+                &mut app,
+                &context,
+                text_center(&output, language.text(Text::ReferenceComfort)),
+            );
+            let output = render(&mut app);
+            click(
+                &mut app,
+                &context,
+                text_center(&output, language.text(Text::Continue)),
+            );
+            assert_eq!(app.setup.step, SetupStep::Sound);
+            assert!(!app.setup.ready());
+        }
+    }
+
+    #[test]
+    fn paused_listening_ignores_the_response_shortcut() {
+        let context = egui::Context::default();
+        theme::configure(&context);
+        let mut raw = input();
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: Some(egui::Key::Space),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = context.run_ui(raw, |ui| {
+            let controls = test_controls(ui, &context, Language::English, true, 0.5, None, true);
+            assert!(!controls.heard);
+        });
+    }
+
+    #[test]
     fn dropdown_switches_an_open_dialog_and_persists_the_choice() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("test.sqlite");
@@ -1576,6 +2101,7 @@ mod tests {
         app.setup.quiet_room = true;
         app.info(Text::BaselineUpdated);
         let context = egui::Context::default();
+        theme::configure(&context);
         let _ = context.run_ui(input(), |ui| app.draw(ui));
         let first = context.run_ui(input(), |ui| app.draw(ui));
         click(&mut app, &context, text_center(&first, "English"));
@@ -1605,6 +2131,7 @@ mod tests {
     #[test]
     fn language_popup_space_does_not_record_a_hearing_response() {
         let context = egui::Context::default();
+        theme::configure(&context);
         let mut app = sample_app(None);
         let _ = context.run_ui(input(), |ui| {
             app.language_selector(ui);
@@ -1643,6 +2170,7 @@ mod tests {
         for language in [Language::English, Language::German] {
             for paused in [false, true] {
                 let context = egui::Context::default();
+                theme::configure(&context);
                 context.set_theme(egui::Theme::Light);
                 let warning = LocalizedText::from(Text::VolumeChanged);
                 let mut deltas = Vec::new();
@@ -1724,7 +2252,7 @@ mod tests {
         std::fs::write(
             std::path::Path::new(&directory).join(format!("{name}.json")),
             serde_json::to_vec(
-                &serde_json::json!({"size": [850, 620], "textures": textures, "meshes": meshes}),
+                &serde_json::json!({"size": [context.content_rect().width() as u32, context.content_rect().height() as u32], "textures": textures, "meshes": meshes}),
             )
             .unwrap(),
         )

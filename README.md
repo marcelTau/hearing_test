@@ -64,6 +64,24 @@ progress and does not change recorded results or baseline comparisons. All
 translations are bundled with the app and work offline. System file-dialog
 controls follow your Linux desktop language.
 
+## Your listening space
+
+The interface uses a light theme with soft blue accents and large controls.
+The overview shows your saved checks, with the most recent check marked at the
+top. Select **View** to open its chart, compare a matching baseline, or export
+a completed check as a PDF. Expand **Detailed measurements** for individual
+frequency values. Report names and local storage details are under
+**Report identity and local data** on the overview.
+
+**Start a listening check** guides you through headphones, a quiet-space
+checklist, reference sounds, and a final review. Each step explains what is
+needed before you can continue. Going back keeps your selections; changing
+the output device requires a fresh confirmation of the reference sound.
+
+During a check, click **I hear it** or press Space only when you hear a tone.
+You can pause at any time; responses are disabled while paused. Decorative
+sound graphics stay static and do not signal tone playback.
+
 ## Before each test
 
 - Use the same AirPods and a quiet room.

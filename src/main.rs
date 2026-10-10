@@ -5,6 +5,7 @@ mod localization;
 mod report;
 mod storage;
 mod test_engine;
+mod theme;
 
 use app::HearingApp;
 use eframe::egui;
