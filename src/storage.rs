@@ -74,6 +74,13 @@ impl SessionRepository {
         Ok(Self { connection, path })
     }
 
+    #[cfg(test)]
+    pub(crate) fn make_read_only_for_test(&self) {
+        self.connection
+            .execute_batch("PRAGMA query_only = ON;")
+            .unwrap();
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -229,6 +236,88 @@ mod tests {
             ceiling_dbfs: crate::domain::CEILING_DBFS,
             protocol_version: PROTOCOL_VERSION,
         }
+    }
+
+    #[test]
+    fn language_preference_survives_reopening_and_does_not_affect_baselines() {
+        use crate::localization::Language;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("test.sqlite");
+        let repository = SessionRepository::open(&path).unwrap();
+        assert_eq!(
+            Language::from_code(repository.preference("language").unwrap().as_deref()),
+            Language::English
+        );
+        let mut session = TestSession::new(setup());
+        session.status = SessionStatus::Completed;
+        session.quality = Some(QualityAssessment {
+            high_confidence: true,
+            catch_trials: 6,
+            false_positive_catches: 0,
+            max_retest_difference_db: 0.0,
+            reasons: vec![],
+        });
+        repository.save(&session).unwrap();
+        let original = serde_json::to_string(&session).unwrap();
+        repository
+            .set_preference("language", Language::German.code())
+            .unwrap();
+        drop(repository);
+        let repository = SessionRepository::open(&path).unwrap();
+        assert_eq!(
+            Language::from_code(repository.preference("language").unwrap().as_deref()),
+            Language::German
+        );
+        let baseline = repository
+            .baseline_for(&session.setup_fingerprint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_string(&baseline).unwrap(), original);
+        assert_eq!(setup().fingerprint(), session.setup_fingerprint);
+        repository
+            .set_preference("language", "unsupported")
+            .unwrap();
+        assert_eq!(
+            Language::from_code(repository.preference("language").unwrap().as_deref()),
+            Language::English
+        );
+    }
+
+    #[test]
+    fn repository_reads_historical_and_new_quality_records() {
+        use crate::domain::{QualityIssue, QualityReason};
+        use crate::localization::Language;
+        let directory = tempdir().unwrap();
+        let repository = SessionRepository::open(directory.path().join("test.sqlite")).unwrap();
+        let mut session = TestSession::new(setup());
+        session.quality = Some(QualityAssessment {
+            high_confidence: false,
+            catch_trials: 2,
+            false_positive_catches: 0,
+            max_retest_difference_db: 0.0,
+            reasons: vec![QualityReason::Legacy(
+                "Too few silent checks were completed".into(),
+            )],
+        });
+        repository.save(&session).unwrap();
+        let old = repository.list().unwrap().remove(0);
+        let reason = &old.quality.unwrap().reasons[0];
+        assert_eq!(
+            Language::German.quality_reason(reason),
+            "Es wurden zu wenige stille Kontrollversuche abgeschlossen"
+        );
+        session.quality.as_mut().unwrap().reasons = vec![QualityIssue::TooFewSilentChecks.into()];
+        repository.save(&session).unwrap();
+        assert_eq!(
+            repository
+                .list()
+                .unwrap()
+                .remove(0)
+                .quality
+                .unwrap()
+                .reasons,
+            session.quality.unwrap().reasons
+        );
     }
 
     #[test]

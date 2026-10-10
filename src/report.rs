@@ -1,4 +1,5 @@
 use crate::domain::{Ear, FREQUENCIES_HZ, TestSession, ThresholdOutcome, compare_sessions};
+use crate::localization::{Language, Text};
 use printpdf::{
     BuiltinFont, Color, Line, LineDashPattern, LinePoint, Mm, Op, PaintMode, PdfDocument,
     PdfFontHandle, PdfPage, PdfSaveOptions, Point, Polygon, PolygonRing, Pt, Rgb, TextItem,
@@ -26,8 +27,12 @@ pub fn save_pdf(
     session: &TestSession,
     baseline: Option<&TestSession>,
     display_name: Option<&str>,
+    language: Language,
 ) -> Result<(), ReportError> {
-    fs::write(path, generate_pdf(session, baseline, display_name))?;
+    fs::write(
+        path,
+        generate_pdf(session, baseline, display_name, language),
+    )?;
     Ok(())
 }
 
@@ -35,130 +40,100 @@ pub fn generate_pdf(
     session: &TestSession,
     baseline: Option<&TestSession>,
     display_name: Option<&str>,
+    language: Language,
 ) -> Vec<u8> {
     let baseline = baseline.filter(|candidate| session.is_comparable_with(candidate));
     let mut ops = Vec::new();
-    text(&mut ops, 42.0, 555.0, 19.0, "Personal Hearing Trend Report");
+    text(
+        &mut ops,
+        42.0,
+        555.0,
+        19.0,
+        language.text(Text::ReportTitle),
+    );
     text(
         &mut ops,
         42.0,
         535.0,
         10.0,
-        "UNCALIBRATED - personal monitoring only; not a clinical audiogram",
+        language.text(Text::ReportSubtitle),
     );
     let date = session.completed_at.unwrap_or(session.started_at).date();
-    text(
-        &mut ops,
-        42.0,
-        514.0,
-        9.0,
-        &format!(
-            "Name: {}    Test date: {:04}-{:02}-{:02}    Session: {}",
+    let identity = language.format(
+        Text::ReportIdentity,
+        &[
             display_name
                 .filter(|name| !name.trim().is_empty())
-                .unwrap_or("Not provided"),
-            date.year(),
-            u8::from(date.month()),
-            date.day(),
-            session.id
-        ),
+                .unwrap_or(language.text(Text::NotProvided))
+                .to_owned(),
+            language.date(date),
+            session.id.to_string(),
+        ],
     );
-    text(
-        &mut ops,
-        42.0,
-        500.0,
-        8.0,
-        &format!(
-            "Output: {} | {} Hz | volume {} | {}",
-            session.setup.device_name,
-            session.setup.sample_rate,
+    fitted_text(&mut ops, 42.0, 514.0, 9.0, 758.0, &identity);
+    let output = language.format(
+        Text::ReportOutput,
+        &[
+            session.setup.device_name.clone(),
+            session.setup.sample_rate.to_string(),
             session
                 .setup
                 .sink_volume_percent
-                .map(|value| format!("{value:.0}%"))
-                .unwrap_or_else(|| "unavailable".to_owned()),
-            session.setup.listening_mode
-        ),
+                .map(|value| format!("{}%", language.number(value, 0)))
+                .unwrap_or_else(|| language.text(Text::Unavailable).into()),
+            language
+                .listening_mode(&session.setup.listening_mode)
+                .to_owned(),
+        ],
     );
-    text(
-        &mut ops,
-        42.0,
-        486.0,
-        8.0,
-        &format!(
-            "Quality: {}{}",
+    fitted_text(&mut ops, 42.0, 500.0, 8.0, 758.0, &output);
+    let quality = language.format(
+        Text::ReportQuality,
+        &[
             session
                 .quality
                 .as_ref()
-                .map(|quality| quality.label())
-                .unwrap_or("Not assessed"),
+                .map(|quality| language.confidence(quality.high_confidence))
+                .unwrap_or(language.text(Text::NotAssessed))
+                .to_owned(),
             baseline
-                .map(|base| format!(" | comparison baseline {}", base.id))
-                .unwrap_or_default()
-        ),
+                .map(|base| language.format(Text::ReportBaseline, &[base.id.to_string()]))
+                .unwrap_or_default(),
+        ],
     );
+    fitted_text(&mut ops, 42.0, 486.0, 8.0, 758.0, &quality);
 
-    draw_grid(&mut ops);
+    draw_grid(&mut ops, language);
     if let Some(base) = baseline {
         draw_session_curves(&mut ops, base, true);
     }
     draw_session_curves(&mut ops, session, false);
-    draw_table(&mut ops, session, baseline);
+    draw_table(&mut ops, session, baseline, language);
 
-    text(&mut ops, 42.0, 168.0, 8.5, "How to read this report");
-    text(
-        &mut ops,
-        42.0,
-        154.0,
-        7.5,
-        "Red circles = right ear; blue crosses = left ear; grey dashed = baseline. Lower dB-R means a quieter digital tone was heard.",
-    );
-    text(
-        &mut ops,
-        42.0,
-        140.0,
-        7.5,
-        "dB-R is an app-defined relative digital scale (0 = -90 dBFS; 60 = -30 dBFS). It is not dB SPL or clinical dB HL.",
-    );
-    text(&mut ops, 42.0, 121.0, 8.5, "Important limitations");
-    text(
-        &mut ops,
-        42.0,
-        107.0,
-        7.5,
-        "AirPods, their fit and processing, system volume, and room noise affect results. The test is unmasked air-conduction screening and cannot diagnose a cause.",
-    );
-    text(
-        &mut ops,
-        42.0,
-        93.0,
-        7.5,
-        "Repeat an unexpected result under the same conditions and arrange a professional hearing assessment if you remain concerned.",
-    );
-    text(
-        &mut ops,
-        42.0,
-        72.0,
-        8.0,
-        "Urgent: sudden hearing loss, rapid worsening, or hearing loss with earache/discharge needs prompt medical assessment; do not wait on this test.",
-    );
-    text(
-        &mut ops,
-        42.0,
-        48.0,
-        7.0,
-        "Protocol: pulsed pure tones, 5 dB up / 10 dB down, 250-8000 Hz, maximum -30 dBFS. Generated by Hearing Tracker.",
-    );
+    // Flow explanatory paragraphs instead of assuming English fits on one line.
+    let mut y = 178.0;
+    for (key, size, gap) in [
+        (Text::ReadReport, 9.0, 4.0),
+        (Text::ReportLegend, 8.0, 2.0),
+        (Text::ReportScale, 8.0, 6.0),
+        (Text::Limitations, 9.0, 4.0),
+        (Text::ReportLimitations, 8.0, 2.0),
+        (Text::RepeatAdvice, 8.0, 6.0),
+        (Text::ReportUrgent, 8.0, 6.0),
+        (Text::ReportProtocol, 7.0, 0.0),
+    ] {
+        y = paragraph(&mut ops, 42.0, y, size, 758.0, language.text(key)) - gap;
+    }
 
     let page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops);
-    let mut document = PdfDocument::new("Personal Hearing Trend Report");
+    let mut document = PdfDocument::new(language.text(Text::ReportTitle));
     let mut warnings = Vec::new();
     document
         .with_pages(vec![page])
         .save(&PdfSaveOptions::default(), &mut warnings)
 }
 
-fn draw_grid(ops: &mut Vec<Op>) {
+fn draw_grid(ops: &mut Vec<Op>, language: Language) {
     let grey = rgb(0.78, 0.80, 0.83);
     ops.push(Op::SetOutlineColor { col: grey });
     ops.push(Op::SetOutlineThickness { pt: Pt(0.55) });
@@ -184,7 +159,7 @@ fn draw_grid(ops: &mut Vec<Op>) {
         PLOT_LEFT + 185.0,
         PLOT_TOP + 25.0,
         7.5,
-        "Frequency (Hz)",
+        language.text(Text::FrequencyHz),
     );
 }
 
@@ -242,15 +217,27 @@ fn draw_session_curves(ops: &mut Vec<Op>, session: &TestSession, baseline: bool)
     });
 }
 
-fn draw_table(ops: &mut Vec<Op>, session: &TestSession, baseline: Option<&TestSession>) {
+fn draw_table(
+    ops: &mut Vec<Op>,
+    session: &TestSession,
+    baseline: Option<&TestSession>,
+    language: Language,
+) {
     let x = 575.0;
-    text(ops, x, 448.0, 9.0, "Thresholds");
-    text(ops, x, 432.0, 7.0, "Hz     R     L    change*");
+    text(ops, x, 448.0, 9.0, language.text(Text::Thresholds));
+    for (offset, label) in [
+        (0.0, "Hz"),
+        (47.0, "R"),
+        (84.0, "L"),
+        (121.0, language.text(Text::Change)),
+    ] {
+        text(ops, x + offset, 432.0, 7.0, label);
+    }
     let deltas = baseline.and_then(|base| compare_sessions(session, base));
     for (row, frequency) in FREQUENCIES_HZ.into_iter().enumerate() {
         let y = 415.0 - row as f32 * 22.0;
-        let right = threshold_text(session, Ear::Right, frequency);
-        let left = threshold_text(session, Ear::Left, frequency);
+        let right = threshold_text(session, Ear::Right, frequency, language);
+        let left = threshold_text(session, Ear::Left, frequency, language);
         let change = deltas
             .as_ref()
             .map(|values| {
@@ -266,21 +253,25 @@ fn draw_table(ops: &mut Vec<Op>, session: &TestSession, baseline: Option<&TestSe
                 }
             })
             .unwrap_or_else(|| "--".to_owned());
-        text(
-            ops,
-            x,
-            y,
-            7.2,
-            &format!("{:<5} {:>4} {:>5} {:>8}", frequency, right, left, change),
-        );
+        for (offset, value) in [
+            (0.0, frequency.to_string()),
+            (47.0, right),
+            (84.0, left),
+            (121.0, change),
+        ] {
+            text(ops, x + offset, y, 8.0, &value);
+        }
     }
-    text(ops, x, 227.0, 6.5, "*mean dB-R change");
-    text(ops, x, 216.0, 6.5, "+ means stronger tone needed");
+    text(ops, x, 227.0, 6.5, language.text(Text::MeanChange));
+    text(ops, x, 216.0, 6.5, language.text(Text::StrongerTone));
+    text(ops, x, 201.0, 6.5, language.text(Text::NoResponseHelp));
 }
 
-fn threshold_text(session: &TestSession, ear: Ear, frequency: u32) -> String {
+fn threshold_text(session: &TestSession, ear: Ear, frequency: u32, language: Language) -> String {
     match session.threshold(ear, frequency) {
-        Some(threshold) if threshold.outcome == ThresholdOutcome::NoResponse => "NR".into(),
+        Some(threshold) if threshold.outcome == ThresholdOutcome::NoResponse => {
+            language.text(Text::NoResponse).into()
+        }
         Some(threshold) => threshold
             .relative_db()
             .map(|value| format!("{value:.0}"))
@@ -324,6 +315,66 @@ fn draw_no_response(ops: &mut Vec<Op>, ear: Ear, x: f32, y: f32) {
     line(ops, x, y + 2.0, x, y - 4.0);
     line(ops, x, y - 4.0, x - 3.0, y - 1.0);
     line(ops, x, y - 4.0, x + 3.0, y - 1.0);
+}
+
+fn text_width(value: &str, size: f32) -> f32 {
+    static FONT: std::sync::OnceLock<printpdf::ParsedFont> = std::sync::OnceLock::new();
+    let font = FONT.get_or_init(|| {
+        BuiltinFont::Helvetica
+            .get_parsed_font()
+            .expect("bundled Helvetica font")
+    });
+    value
+        .chars()
+        .map(|character| {
+            font.lookup_glyph_index(character as u32)
+                .and_then(|glyph| font.get_glyph_width(glyph))
+                .map(|width| width as f32 / font.units_per_em as f32)
+                .unwrap_or(1.0)
+                * size
+        })
+        .sum()
+}
+
+fn fitted_text(ops: &mut Vec<Op>, x: f32, y: f32, size: f32, width: f32, value: &str) {
+    let actual_width = text_width(value, size);
+    let size = if actual_width > width {
+        size * width / actual_width
+    } else {
+        size
+    };
+    text(ops, x, y, size, value);
+}
+
+fn wrapped_lines(value: &str, size: f32, width: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{current} {word}")
+        };
+        if !current.is_empty() && text_width(&candidate, size) > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn paragraph(ops: &mut Vec<Op>, x: f32, mut y: f32, size: f32, width: f32, value: &str) -> f32 {
+    for line in wrapped_lines(value, size, width) {
+        fitted_text(ops, x, y, size, width, &line);
+        y -= size * 1.4;
+    }
+    y
 }
 
 fn text(ops: &mut Vec<Op>, x: f32, y: f32, size: f32, value: &str) {
@@ -399,11 +450,11 @@ mod tests {
         AudioSetup, CEILING_DBFS, PROTOCOL_VERSION, QualityAssessment, SessionStatus,
     };
 
-    #[test]
-    fn generated_report_is_a_pdf() {
+    fn sample_session() -> TestSession {
+        use crate::domain::Threshold;
         let setup = AudioSetup {
             device_id: "test".into(),
-            device_name: "AirPods".into(),
+            device_name: "AirPods Pro".into(),
             backend: "ALSA".into(),
             sample_rate: 48_000,
             channels: 2,
@@ -413,6 +464,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
         };
         let mut session = TestSession::new(setup);
+        session.started_at = time::macros::datetime!(2026-10-10 12:00 UTC);
         session.status = SessionStatus::Completed;
         session.completed_at = Some(session.started_at);
         session.quality = Some(QualityAssessment {
@@ -422,8 +474,115 @@ mod tests {
             max_retest_difference_db: 0.0,
             reasons: vec![],
         });
-        let bytes = generate_pdf(&session, None, Some("Test Person"));
-        assert!(bytes.starts_with(b"%PDF-"));
-        assert!(bytes.len() > 1_000);
+        for ear in [Ear::Right, Ear::Left] {
+            for (index, frequency_hz) in FREQUENCIES_HZ.into_iter().enumerate() {
+                let no_response = ear == Ear::Left && index == 7;
+                session.thresholds.push(Threshold {
+                    ear,
+                    frequency_hz,
+                    dbfs: if no_response {
+                        None
+                    } else {
+                        Some(-65.0 + index as f32 * 5.0)
+                    },
+                    outcome: if no_response {
+                        ThresholdOutcome::NoResponse
+                    } else {
+                        ThresholdOutcome::Measured
+                    },
+                });
+            }
+        }
+        session
+    }
+
+    #[test]
+    fn bilingual_reports_preserve_results_and_german_characters() {
+        let session = sample_session();
+        let mut baseline = session.clone();
+        baseline.id = uuid::Uuid::now_v7();
+        for threshold in &mut baseline.thresholds {
+            threshold.dbfs = threshold.dbfs.map(|value| value - 5.0);
+        }
+        let original = serde_json::to_string(&session).unwrap();
+        for language in [Language::English, Language::German] {
+            let bytes = generate_pdf(&session, Some(&baseline), Some("Jörg Weiß"), language);
+            assert!(bytes.starts_with(b"%PDF-"));
+            let parsed = PdfDocument::parse(
+                &bytes,
+                &printpdf::PdfParseOptions::default(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let text = parsed
+                .extract_text()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(text.contains(language.text(Text::ReportTitle)), "{text}");
+            assert!(text.contains("Jörg Weiß"), "{text}");
+            assert!(
+                text.contains(&language.date(session.started_at.date())),
+                "{text}"
+            );
+            assert!(
+                text.contains(language.text(Text::NoiseCancellation)),
+                "{text}"
+            );
+            assert!(text.contains(language.text(Text::HighConfidence)), "{text}");
+            assert!(text.contains(language.text(Text::NoResponse)), "{text}");
+            if language == Language::German {
+                assert!(!text.contains("Noise cancellation"));
+                assert!(!text.contains("High confidence"));
+                assert!(text.contains("ärztliche"), "{text}");
+            }
+            assert_eq!(serde_json::to_string(&session).unwrap(), original);
+            if let Ok(directory) = std::env::var("HEARING_TEST_QA_DIR") {
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(
+                    Path::new(&directory).join(format!("report-{}.pdf", language.code())),
+                    &bytes,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn translated_report_text_stays_inside_page() {
+        for language in [Language::English, Language::German] {
+            let bytes = generate_pdf(&sample_session(), None, None, language);
+            let parsed = PdfDocument::parse(
+                &bytes,
+                &printpdf::PdfParseOptions::default(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let (mut x, mut y, mut size) = (0.0, 0.0, 0.0);
+            for op in &parsed.pages[0].ops {
+                match op {
+                    Op::SetTextCursor { pos } => {
+                        x = pos.x.0;
+                        y = pos.y.0;
+                    }
+                    Op::SetFont {
+                        size: font_size, ..
+                    } => size = font_size.0,
+                    Op::ShowText { items } => {
+                        for item in items {
+                            if let TextItem::Text(value) = item {
+                                assert!(y > 20.0 && y < 575.0, "{value}: y={y}");
+                                assert!(
+                                    x + text_width(value, size) <= 810.0,
+                                    "{value}: x={x}, size={size}"
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
