@@ -119,15 +119,54 @@ pub struct QualityAssessment {
     pub catch_trials: u32,
     pub false_positive_catches: u32,
     pub max_retest_difference_db: f32,
-    pub reasons: Vec<String>,
+    pub reasons: Vec<QualityReason>,
 }
 
-impl QualityAssessment {
-    pub fn label(&self) -> &'static str {
-        if self.high_confidence {
-            "High confidence"
-        } else {
-            "Low confidence"
+/// Legacy strings remain readable without rewriting historical session JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum QualityReason {
+    Issue(QualityIssue),
+    Legacy(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum QualityIssue {
+    RepeatDifference { db: f32 },
+    TooFewSilentChecks,
+    SilentResponses { percent: f32 },
+    VolumeUnavailable,
+}
+
+impl From<QualityIssue> for QualityReason {
+    fn from(issue: QualityIssue) -> Self {
+        Self::Issue(issue)
+    }
+}
+
+impl QualityIssue {
+    pub fn from_legacy(value: &str) -> Option<Self> {
+        match value {
+            "Too few silent checks were completed" => Some(Self::TooFewSilentChecks),
+            "Linux output volume was unavailable, so setup matching cannot be verified" => {
+                Some(Self::VolumeUnavailable)
+            }
+            _ => {
+                if let Some(db) = value
+                    .strip_prefix("The 1000 Hz repeat differed by ")
+                    .and_then(|value| value.strip_suffix(" dB"))
+                    .and_then(|value| value.parse().ok())
+                {
+                    Some(Self::RepeatDifference { db })
+                } else {
+                    value
+                        .strip_prefix("Responses occurred on ")
+                        .and_then(|value| value.strip_suffix("% of silent checks"))
+                        .and_then(|value| value.parse().ok())
+                        .map(|percent| Self::SilentResponses { percent })
+                }
+            }
         }
     }
 }
@@ -221,6 +260,49 @@ pub fn compare_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_and_structured_quality_reasons_are_compatible() {
+        use crate::localization::Language;
+        let legacy = r#"[
+            "The 1000 Hz repeat differed by 10 dB",
+            "Too few silent checks were completed",
+            "Responses occurred on 25% of silent checks",
+            "Linux output volume was unavailable, so setup matching cannot be verified",
+            "Unrecognized historical note"
+        ]"#;
+        let reasons: Vec<QualityReason> = serde_json::from_str(legacy).unwrap();
+        let expected = [
+            QualityIssue::RepeatDifference { db: 10.0 },
+            QualityIssue::TooFewSilentChecks,
+            QualityIssue::SilentResponses { percent: 25.0 },
+            QualityIssue::VolumeUnavailable,
+        ];
+        for (reason, issue) in reasons.iter().zip(expected) {
+            let structured = QualityReason::from(issue);
+            for language in [Language::English, Language::German] {
+                assert_eq!(
+                    language.quality_reason(reason),
+                    language.quality_reason(&structured)
+                );
+            }
+            let json = serde_json::to_string(&structured).unwrap();
+            assert!(json.contains("code"));
+            assert_eq!(
+                serde_json::from_str::<QualityReason>(&json).unwrap(),
+                structured
+            );
+        }
+        assert_eq!(
+            Language::German.quality_reason(&reasons[4]),
+            "Unrecognized historical note"
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<QualityReason>>(&serde_json::to_string(&reasons).unwrap())
+                .unwrap(),
+            reasons
+        );
+    }
 
     fn completed_session(device: &str, dbfs: f32) -> TestSession {
         let setup = AudioSetup {

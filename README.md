@@ -52,6 +52,18 @@ install -Dm755 target/release/hearing_test ~/.local/bin/hearing-test
 
 The program uses PipeWire/PulseAudio through CPAL. `wpctl` (preferred) or `pactl` is used read-only to record the default output volume.
 
+## Application language
+
+Use the **Language / Sprache** dropdown in the top-right header to choose
+**English** or **Deutsch**. The interface changes immediately, and the selection
+is remembered on the next launch. English is the default.
+
+PDF reports use the language selected when you export them, including reports
+for older tests. Changing the language preserves setup selections and test
+progress and does not change recorded results or baseline comparisons. All
+translations are bundled with the app and work offline. System file-dialog
+controls follow your Linux desktop language.
+
 ## Before each test
 
 - Use the same AirPods and a quiet room.

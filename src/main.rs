@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod domain;
+mod localization;
 mod report;
 mod storage;
 mod test_engine;

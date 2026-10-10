@@ -1,6 +1,6 @@
 use crate::domain::{
-    CEILING_DBFS, Ear, FLOOR_DBFS, QualityAssessment, START_DBFS, Threshold, ThresholdOutcome,
-    Trial,
+    CEILING_DBFS, Ear, FLOOR_DBFS, QualityAssessment, QualityIssue, START_DBFS, Threshold,
+    ThresholdOutcome, Trial,
 };
 use std::collections::BTreeMap;
 
@@ -271,19 +271,23 @@ impl TestEngine {
         };
         let mut reasons = Vec::new();
         if max_retest_difference_db > 5.0 {
-            reasons.push(format!(
-                "The 1000 Hz repeat differed by {:.0} dB",
-                max_retest_difference_db
-            ));
+            reasons.push(
+                QualityIssue::RepeatDifference {
+                    db: max_retest_difference_db,
+                }
+                .into(),
+            );
         }
         if self.catch_trials < 4 {
-            reasons.push("Too few silent checks were completed".to_owned());
+            reasons.push(QualityIssue::TooFewSilentChecks.into());
         }
         if catch_rate > 0.2 {
-            reasons.push(format!(
-                "Responses occurred on {:.0}% of silent checks",
-                catch_rate * 100.0
-            ));
+            reasons.push(
+                QualityIssue::SilentResponses {
+                    percent: catch_rate * 100.0,
+                }
+                .into(),
+            );
         }
         let quality = QualityAssessment {
             high_confidence: reasons.is_empty(),

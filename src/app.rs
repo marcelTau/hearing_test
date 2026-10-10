@@ -2,9 +2,10 @@ use crate::audio::{
     AudioDeviceInfo, AudioEngine, AudioEvent, ToneRequest, system_output_volume_percent,
 };
 use crate::domain::{
-    AudioSetup, CEILING_DBFS, Ear, FREQUENCIES_HZ, PROTOCOL_VERSION, SessionStatus, TestSession,
-    ThresholdOutcome,
+    AudioSetup, CEILING_DBFS, Ear, FREQUENCIES_HZ, PROTOCOL_VERSION, QualityIssue, SessionStatus,
+    TestSession, ThresholdOutcome,
 };
+use crate::localization::{Language, LocalizedText, Text};
 use crate::report;
 use crate::storage::SessionRepository;
 use crate::test_engine::{Presentation, TestEngine};
@@ -14,8 +15,6 @@ use eframe::egui::{
 use rand::Rng;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-
-const URGENT_WARNING: &str = "Sudden hearing loss, hearing worsening over days or weeks, or hearing loss with earache or discharge needs urgent medical assessment. Do not wait for a home test.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -32,13 +31,14 @@ pub struct HearingApp {
     setup: SetupState,
     running: Option<TestRun>,
     display_name: String,
+    language: Language,
     message: Option<Message>,
     delete_confirmation: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
 struct Message {
-    text: String,
+    text: LocalizedText,
     error: bool,
 }
 
@@ -81,7 +81,7 @@ struct TestRun {
     next_token: u64,
     real_since_catch: u32,
     catch_after: u32,
-    warning: Option<String>,
+    warning: Option<LocalizedText>,
 }
 
 enum RunPhase {
@@ -119,12 +119,17 @@ impl HearingApp {
                 Vec::new(),
                 String::new(),
                 Some(Message {
-                    text: error.to_string(),
+                    text: error.into(),
                     error: true,
                 }),
             ),
         };
+        let language = repository
+            .as_ref()
+            .and_then(|repository| repository.preference("language").ok().flatten());
+        let language = Language::from_code(language.as_deref());
         Self {
+            language,
             repository,
             sessions,
             page: Page::Dashboard,
@@ -136,23 +141,66 @@ impl HearingApp {
         }
     }
 
+    fn language_selector(&mut self, ui: &mut egui::Ui) -> bool {
+        let was_open = egui::Popup::is_any_open(ui.ctx());
+        let previous = self.language;
+        let response = egui::ComboBox::from_id_salt("application_language")
+            .selected_text(self.language.name())
+            .width(95.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.language, Language::English, "English");
+                ui.selectable_value(&mut self.language, Language::German, "Deutsch");
+            })
+            .response;
+        ui.label(self.language.text(Text::Language));
+        if self.language != previous {
+            self.set_language(self.language);
+        }
+        let allow_space = hearing_shortcut_allowed(
+            was_open,
+            egui::Popup::is_any_open(ui.ctx()),
+            response.has_focus(),
+            self.message.is_some(),
+        );
+        if !allow_space {
+            ui.ctx().input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Space);
+            });
+        }
+        allow_space
+    }
+
+    fn set_language(&mut self, language: Language) {
+        self.language = language;
+        let error = match &self.repository {
+            Some(repository) => repository
+                .set_preference("language", language.code())
+                .err()
+                .map(LocalizedText::from),
+            None => Some(LocalizedText::from(Text::StorageUnavailable)),
+        };
+        if let Some(error) = error {
+            self.error(LocalizedText::because(Text::LanguageSaveError, error));
+        }
+    }
+
     fn refresh_sessions(&mut self) {
         if let Some(repository) = &self.repository {
             match repository.list() {
                 Ok(sessions) => self.sessions = sessions,
-                Err(error) => self.error(error.to_string()),
+                Err(error) => self.error(error),
             }
         }
     }
 
-    fn error(&mut self, text: impl Into<String>) {
+    fn error(&mut self, text: impl Into<LocalizedText>) {
         self.message = Some(Message {
             text: text.into(),
             error: true,
         });
     }
 
-    fn info(&mut self, text: impl Into<String>) {
+    fn info(&mut self, text: impl Into<LocalizedText>) {
         self.message = Some(Message {
             text: text.into(),
             error: false,
@@ -181,7 +229,7 @@ impl HearingApp {
                 self.setup.volume = system_output_volume_percent();
                 self.setup.audio = None;
             }
-            Err(error) => self.error(error.to_string()),
+            Err(error) => self.error(error),
         }
     }
 
@@ -190,7 +238,7 @@ impl HearingApp {
             return true;
         }
         let Some(device) = self.setup.devices.get(self.setup.selected_device) else {
-            self.error("Select a stereo output device first");
+            self.error(Text::SelectDevice);
             return false;
         };
         match AudioEngine::open(&device.id) {
@@ -199,7 +247,7 @@ impl HearingApp {
                 true
             }
             Err(error) => {
-                self.error(error.to_string());
+                self.error(error);
                 false
             }
         }
@@ -219,7 +267,7 @@ impl HearingApp {
                 dbfs: Some(CEILING_DBFS),
             })
         {
-            self.error(error.to_string());
+            self.error(error);
         }
     }
 
@@ -244,7 +292,7 @@ impl HearingApp {
         if let Some(repository) = &self.repository
             && let Err(error) = repository.save(&session)
         {
-            self.error(error.to_string());
+            self.error(error);
             self.setup.audio = Some(audio);
             return;
         }
@@ -267,7 +315,7 @@ impl HearingApp {
                 if let (Some(repository), Some(run)) = (&self.repository, &self.running)
                     && let Err(error) = repository.save(&run.session)
                 {
-                    self.error(error.to_string());
+                    self.error(error);
                 }
             }
             TestAction::Completed(session) => {
@@ -275,7 +323,7 @@ impl HearingApp {
                 if let Some(repository) = &self.repository
                     && let Err(error) = repository.save(&session)
                 {
-                    self.error(error.to_string());
+                    self.error(error);
                 }
                 self.running = None;
                 self.refresh_sessions();
@@ -285,39 +333,54 @@ impl HearingApp {
                 if let Some(repository) = &self.repository
                     && let Err(error) = repository.save(&session)
                 {
-                    self.error(error.to_string());
+                    self.error(error);
                 }
                 self.running = None;
                 self.refresh_sessions();
                 self.page = Page::Dashboard;
-                self.info("The incomplete test was saved as abandoned and excluded from trends.");
+                self.info(Text::AbandonedSaved);
             }
         }
     }
 }
 
-impl eframe::App for HearingApp {
-    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl HearingApp {
+    fn draw(&mut self, root_ui: &mut egui::Ui) {
         let context = root_ui.ctx().clone();
         egui::Frame::central_panel(root_ui.style()).show(root_ui, |ui| {
+            let mut allow_space = false;
             ui.horizontal(|ui| {
                 ui.heading("Hearing Tracker");
-                ui.separator();
-                ui.label(
-                    RichText::new("Personal, uncalibrated monitoring").color(Color32::DARK_GRAY),
-                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    allow_space = self.language_selector(ui);
                     if self.page != Page::Dashboard
-                        && ui.button("Home").clicked()
+                        && ui.button(self.language.text(Text::Home)).clicked()
                         && self.running.is_none()
                     {
                         self.page = Page::Dashboard;
                     }
                 });
             });
+            let language = self.language;
+            ui.label(RichText::new(language.text(Text::Subtitle)).color(Color32::DARK_GRAY));
             ui.separator();
+            let warning: egui::WidgetText = RichText::new(language.text(Text::UrgentWarning))
+                .small()
+                .color(Color32::from_rgb(145, 67, 20))
+                .into();
+            let warning_height = warning
+                .clone()
+                .into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Wrap),
+                    ui.available_width(),
+                    egui::TextStyle::Small,
+                )
+                .size()
+                .y;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
+                .max_height((ui.available_height() - warning_height - 24.0).max(0.0))
                 .show(ui, |ui| match self.page {
                     Page::Dashboard => self.dashboard_ui(ui),
                     Page::Setup => self.setup_ui(ui),
@@ -325,34 +388,32 @@ impl eframe::App for HearingApp {
                         let action = self
                             .running
                             .as_mut()
-                            .map(|run| run.ui(ui, &context))
+                            .map(|run| run.ui(ui, &context, language, allow_space))
                             .unwrap_or(TestAction::None);
                         self.handle_test_action(action);
                     }
                     Page::Results(id) => self.results_ui(ui, id),
                 });
             ui.separator();
-            ui.label(
-                RichText::new(URGENT_WARNING)
-                    .small()
-                    .color(Color32::from_rgb(145, 67, 20)),
-            );
+            ui.label(warning);
         });
 
+        let language = self.language;
         if let Some(message) = self.message.clone() {
             egui::Window::new(if message.error {
-                "Problem"
+                language.text(Text::Problem)
             } else {
                 "Hearing Tracker"
             })
+            .id(egui::Id::new("app_message"))
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(&context, |ui| {
                 ui.set_max_width(440.0);
-                ui.label(message.text);
+                ui.label(message.text.render(language));
                 ui.add_space(8.0);
-                if ui.button("OK").clicked() {
+                if ui.button(language.text(Text::Ok)).clicked() {
                     self.message = None;
                 }
             });
@@ -362,31 +423,27 @@ impl eframe::App for HearingApp {
 
 impl HearingApp {
     fn dashboard_ui(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.heading("Track changes using the same AirPods setup");
-                ui.label("This app compares repeatable digital thresholds between ears and dates. It cannot diagnose hearing loss or produce clinical dB HL values.");
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_sized([150.0, 42.0], egui::Button::new("Start a new test"))
-                    .clicked()
-                {
-                    self.enter_setup();
-                }
-            });
-        });
+        ui.heading(language.text(Text::DashboardHeading));
+        ui.label(language.text(Text::DashboardIntro));
+        ui.add_space(8.0);
+        if ui
+            .add(egui::Button::new(language.text(Text::StartTest)).min_size(Vec2::new(170.0, 42.0)))
+            .clicked()
+        {
+            self.enter_setup();
+        }
         ui.add_space(18.0);
         ui.separator();
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.heading("History");
-            ui.label(format!("{} saved sessions", self.sessions.len()));
+            ui.heading(language.text(Text::History));
+            ui.label(language.format(Text::SavedSessions, &[self.sessions.len().to_string()]));
         });
         if self.sessions.is_empty() {
             ui.add_space(24.0);
-            ui.label("No tests yet. Your first complete, high-confidence test becomes the baseline for this exact audio setup.");
+            ui.label(language.text(Text::NoTests));
         } else {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 egui::Grid::new("history_grid")
@@ -394,10 +451,10 @@ impl HearingApp {
                     .striped(true)
                     .spacing([24.0, 10.0])
                     .show(ui, |ui| {
-                        ui.strong("Date");
-                        ui.strong("Status");
-                        ui.strong("Quality");
-                        ui.strong("Output");
+                        ui.strong(language.text(Text::Date));
+                        ui.strong(language.text(Text::Status));
+                        ui.strong(language.text(Text::Quality));
+                        ui.strong(language.text(Text::Output));
                         ui.strong("");
                         ui.end_row();
                         let rows: Vec<_> = self
@@ -406,12 +463,12 @@ impl HearingApp {
                             .map(|session| {
                                 (
                                     session.id,
-                                    date_label(session),
-                                    format!("{:?}", session.status),
+                                    language.date(session.started_at.date()),
+                                    language.status(session.status).to_owned(),
                                     session
                                         .quality
                                         .as_ref()
-                                        .map(|q| q.label())
+                                        .map(|q| language.confidence(q.high_confidence))
                                         .unwrap_or("--")
                                         .to_owned(),
                                     session.setup.device_name.clone(),
@@ -423,7 +480,7 @@ impl HearingApp {
                             ui.label(status);
                             ui.label(quality);
                             ui.label(output);
-                            if ui.button("View").clicked() {
+                            if ui.button(language.text(Text::View)).clicked() {
                                 self.page = Page::Results(id);
                             }
                             ui.end_row();
@@ -433,46 +490,56 @@ impl HearingApp {
         }
         ui.add_space(16.0);
         ui.separator();
-        ui.collapsing("Report identity and local data", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Optional name on PDF reports:");
-                let response = ui.text_edit_singleline(&mut self.display_name);
-                if response.lost_focus()
-                    && let Some(repository) = &self.repository
-                    && let Err(error) =
-                        repository.set_preference("display_name", &self.display_name)
-                {
-                    self.error(error.to_string());
+        egui::CollapsingHeader::new(language.text(Text::LocalData))
+            .id_salt("local_data")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(language.text(Text::ReportName));
+                    let response = ui.text_edit_singleline(&mut self.display_name);
+                    if response.lost_focus()
+                        && let Some(repository) = &self.repository
+                        && let Err(error) =
+                            repository.set_preference("display_name", &self.display_name)
+                    {
+                        self.error(error);
+                    }
+                });
+                if let Some(repository) = &self.repository {
+                    ui.small(language.format(
+                        Text::DatabasePath,
+                        &[repository.path().display().to_string()],
+                    ));
                 }
+                ui.small(language.text(Text::Privacy));
             });
-            if let Some(repository) = &self.repository {
-                ui.small(format!("Local database: {}", repository.path().display()));
-            }
-            ui.small("Data stays on this computer and is not encrypted or uploaded.");
-        });
     }
 
     fn setup_ui(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         ui.add_space(10.0);
-        ui.heading("Prepare a repeatable, comfortable setup");
-        ui.label("Use the same AirPods, Linux volume, fit, room, and listening mode for every comparable test.");
+        ui.heading(language.text(Text::SetupHeading));
+        ui.label(language.text(Text::SetupIntro));
         ui.add_space(10.0);
 
         ui.group(|ui| {
-            ui.strong("1. Output device");
+            ui.strong(language.text(Text::OutputStep));
             ui.horizontal(|ui| {
                 let selected_name = self
                     .setup
                     .devices
                     .get(self.setup.selected_device)
                     .map(|device| device.name.as_str())
-                    .unwrap_or("No output device");
+                    .unwrap_or(language.text(Text::NoOutput));
                 egui::ComboBox::from_id_salt("output_device")
                     .selected_text(selected_name)
                     .show_ui(ui, |ui| {
                         for (index, device) in self.setup.devices.iter().enumerate() {
                             if ui
-                                .selectable_value(&mut self.setup.selected_device, index, &device.name)
+                                .selectable_value(
+                                    &mut self.setup.selected_device,
+                                    index,
+                                    &device.name,
+                                )
                                 .changed()
                             {
                                 self.setup.audio = None;
@@ -480,55 +547,73 @@ impl HearingApp {
                             }
                         }
                     });
-                if ui.button("Refresh").clicked() {
+                if ui.button(language.text(Text::Refresh)).clicked() {
                     self.load_devices();
                 }
             });
             if let Some(device) = self.setup.devices.get(self.setup.selected_device) {
-                ui.small(format!("{} Hz, {} channels, {} backend", device.sample_rate, device.channels, device.backend));
+                ui.small(language.format(
+                    Text::DeviceDetails,
+                    &[
+                        device.sample_rate.to_string(),
+                        device.channels.to_string(),
+                        device.backend.clone(),
+                    ],
+                ));
             }
             ui.label(match self.setup.volume {
-                Some(volume) => format!("Current default-output volume: {volume:.0}% (recorded for comparisons)"),
-                None => "Linux output volume could not be read; this test can be viewed but will not qualify for trends.".to_owned(),
+                Some(volume) => language.format(Text::CurrentVolume, &[language.number(volume, 0)]),
+                None => language.text(Text::VolumeUnknown).to_owned(),
             });
         });
         ui.add_space(8.0);
 
         ui.group(|ui| {
-            ui.strong("2. AirPods and room checklist");
-            ui.checkbox(&mut self.setup.quiet_room, "I am in a quiet room and both AirPods fit securely");
-            ui.checkbox(&mut self.setup.noise_cancellation, "Noise Cancellation is on (not Adaptive or Transparency)");
-            ui.checkbox(&mut self.setup.processing_off, "Spatial Audio, personalized volume, conversation awareness, headphone accommodations, and hearing assistance are off");
+            ui.strong(language.text(Text::ChecklistStep));
+            ui.checkbox(&mut self.setup.quiet_room, language.text(Text::QuietRoom));
+            ui.checkbox(
+                &mut self.setup.noise_cancellation,
+                language.text(Text::CancellationOn),
+            );
+            ui.checkbox(
+                &mut self.setup.processing_off,
+                language.text(Text::ProcessingOff),
+            );
         });
         ui.add_space(8.0);
 
         ui.group(|ui| {
-            ui.strong("3. Check the gentle reference tone and channels");
-            ui.label("The test never exceeds this -30 dBFS reference. It should be clearly audible but not loud. Do not turn the volume up if it is uncomfortable or inaudible.");
+            ui.strong(language.text(Text::ReferenceStep));
+            ui.label(language.text(Text::ReferenceHelp));
             ui.horizontal(|ui| {
-                if ui.button("Play left").clicked() {
+                if ui.button(language.text(Text::PlayLeft)).clicked() {
                     self.play_setup_tone(Ear::Left);
                 }
-                if ui.button("Play right").clicked() {
+                if ui.button(language.text(Text::PlayRight)).clicked() {
                     self.play_setup_tone(Ear::Right);
                 }
             });
-            ui.checkbox(&mut self.setup.comfortable, "I heard the correct side and the reference was comfortable, not loud");
+            ui.checkbox(
+                &mut self.setup.comfortable,
+                language.text(Text::ReferenceComfort),
+            );
         });
         ui.add_space(8.0);
 
         ui.group(|ui| {
-            ui.strong("4. Ear order");
-            ui.label(
-                "If you know which ear is better, test it first. Otherwise keep Right selected.",
-            );
+            ui.strong(language.text(Text::EarOrderStep));
+            ui.label(language.text(Text::EarOrderHelp));
             ui.horizontal(|ui| {
                 ui.radio_value(
                     &mut self.setup.first_ear,
                     Ear::Right,
-                    "Right first / unsure",
+                    language.text(Text::RightFirst),
                 );
-                ui.radio_value(&mut self.setup.first_ear, Ear::Left, "Left first");
+                ui.radio_value(
+                    &mut self.setup.first_ear,
+                    Ear::Left,
+                    language.text(Text::LeftFirst),
+                );
             });
         });
         ui.add_space(14.0);
@@ -541,34 +626,41 @@ impl HearingApp {
         if ui
             .add_enabled(
                 ready,
-                egui::Button::new(RichText::new("Begin test").size(17.0)),
+                egui::Button::new(RichText::new(language.text(Text::BeginTest)).size(17.0)),
             )
             .clicked()
         {
             self.start_test();
         }
-        ui.label("Expected duration: about 12-18 minutes. Press Space or click only when you hear a tone, even if it is very faint.");
+        ui.label(language.text(Text::Duration));
     }
 
     fn results_ui(&mut self, ui: &mut egui::Ui, id: Uuid) {
+        let language = self.language;
         let Some(session) = self
             .sessions
             .iter()
             .find(|session| session.id == id)
             .cloned()
         else {
-            ui.label("This session is no longer available.");
+            ui.label(language.text(Text::SessionMissing));
             return;
         };
         let baseline = self.baseline_for(&session);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.heading(format!("Results - {}", date_label(&session)));
+            ui.heading(language.format(
+                Text::ResultsDate,
+                &[language.date(session.started_at.date())],
+            ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if session.status == SessionStatus::Completed && ui.button("Export PDF").clicked() {
+                if session.status == SessionStatus::Completed
+                    && ui.button(language.text(Text::ExportPdf)).clicked()
+                {
                     let suggested = format!("hearing-report-{}.pdf", session.started_at.date());
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PDF report", &["pdf"])
+                        .set_title(language.text(Text::ExportPdf))
+                        .add_filter(language.text(Text::PdfReport), &["pdf"])
                         .set_file_name(&suggested)
                         .save_file()
                     {
@@ -577,85 +669,103 @@ impl HearingApp {
                             &session,
                             baseline.as_ref(),
                             Some(&self.display_name),
+                            language,
                         ) {
-                            Ok(()) => self.info(format!("Report saved to {}", path.display())),
-                            Err(error) => self.error(error.to_string()),
+                            Ok(()) => self.info(LocalizedText::with(
+                                Text::ReportSaved,
+                                [path.display().to_string()],
+                            )),
+                            Err(error) => self.error(error),
                         }
                     }
                 }
             });
         });
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("Status: {:?}", session.status));
-            ui.separator();
-            ui.label(format!("Output: {}", session.setup.device_name));
-            ui.separator();
-            ui.label(format!(
-                "Volume: {}",
-                session
-                    .setup
-                    .sink_volume_percent
-                    .map(|value| format!("{value:.0}%"))
-                    .unwrap_or_else(|| "unavailable".into())
+            ui.label(language.format(
+                Text::StatusValue,
+                &[language.status(session.status).to_owned()],
             ));
+            ui.separator();
+            ui.label(language.format(
+                Text::OutputValue,
+                std::slice::from_ref(&session.setup.device_name),
+            ));
+            ui.separator();
+            ui.label(
+                language.format(
+                    Text::VolumeValue,
+                    &[session
+                        .setup
+                        .sink_volume_percent
+                        .map(|value| format!("{}%", language.number(value, 0)))
+                        .unwrap_or_else(|| language.text(Text::Unavailable).into())],
+                ),
+            );
             if let Some(quality) = &session.quality {
                 ui.separator();
                 ui.label(
-                    RichText::new(quality.label()).color(if quality.high_confidence {
-                        Color32::DARK_GREEN
-                    } else {
-                        Color32::DARK_RED
-                    }),
+                    RichText::new(language.confidence(quality.high_confidence)).color(
+                        if quality.high_confidence {
+                            Color32::DARK_GREEN
+                        } else {
+                            Color32::DARK_RED
+                        },
+                    ),
                 );
             }
         });
         if let Some(quality) = &session.quality {
             for reason in &quality.reasons {
-                ui.label(RichText::new(format!("• {reason}")).color(Color32::DARK_RED));
+                ui.label(
+                    RichText::new(format!("• {}", language.quality_reason(reason)))
+                        .color(Color32::DARK_RED),
+                );
             }
         }
         ui.add_space(8.0);
-        audiogram(ui, &session, baseline.as_ref());
+        audiogram(ui, &session, baseline.as_ref(), language);
         ui.add_space(8.0);
-        threshold_table(ui, &session, baseline.as_ref());
+        threshold_table(ui, &session, baseline.as_ref(), language);
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             if session
                 .quality
                 .as_ref()
                 .is_some_and(|quality| quality.high_confidence)
-                && ui.button("Use as baseline for this setup").clicked()
+                && ui.button(language.text(Text::UseBaseline)).clicked()
                 && let Some(repository) = &self.repository
             {
                 match repository.set_baseline(&session) {
-                    Ok(()) => self.info("Baseline updated for this exact setup."),
-                    Err(error) => self.error(error.to_string()),
+                    Ok(()) => self.info(Text::BaselineUpdated),
+                    Err(error) => self.error(error),
                 }
             }
-            if ui.button("Delete session…").clicked() {
+            if ui.button(language.text(Text::DeleteSession)).clicked() {
                 self.delete_confirmation = Some(id);
             }
         });
 
         if self.delete_confirmation == Some(id) {
-            egui::Window::new("Delete this session?")
+            egui::Window::new(language.text(Text::DeleteQuestion))
+                .id(egui::Id::new("delete_session"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ui.ctx(), |ui| {
-                    ui.label("This permanently removes the local session and its raw trials.");
+                    ui.label(language.text(Text::DeleteWarning));
                     ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(language.text(Text::Cancel)).clicked() {
                             self.delete_confirmation = None;
                         }
                         if ui
-                            .button(RichText::new("Delete").color(Color32::RED))
+                            .button(RichText::new(language.text(Text::Delete)).color(Color32::RED))
                             .clicked()
                         {
                             if let Some(repository) = &self.repository
                                 && let Err(error) = repository.delete(id)
                             {
-                                self.error(error.to_string());
+                                self.error(error);
                                 return;
                             }
                             self.delete_confirmation = None;
@@ -683,7 +793,13 @@ impl TestRun {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) -> TestAction {
+    fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: &egui::Context,
+        language: Language,
+        allow_space: bool,
+    ) -> TestAction {
         context.request_repaint_after(Duration::from_millis(25));
         self.poll_audio();
         let now = Instant::now();
@@ -698,37 +814,20 @@ impl TestRun {
             return self.record(false, None);
         }
 
-        ui.vertical_centered(|ui| {
-            ui.add_space(45.0);
-            ui.heading("Listen for very faint pulsed tones");
-            ui.label("Click the button or press Space whenever you hear one. Some waiting periods contain no tone.");
-            ui.add_space(20.0);
-            let progress = self.engine.as_ref().map(TestEngine::progress).unwrap_or(1.0);
-            ui.add(egui::ProgressBar::new(progress).desired_width(500.0));
-            ui.label(format!("{:.0}% complete", progress * 100.0));
-            ui.add_space(45.0);
-        });
+        let controls = test_controls(
+            ui,
+            context,
+            language,
+            allow_space,
+            self.engine
+                .as_ref()
+                .map(TestEngine::progress)
+                .unwrap_or(1.0),
+            self.warning.as_ref(),
+            matches!(self.phase, RunPhase::Paused),
+        );
 
-        let heard = ui
-            .vertical_centered(|ui| {
-                ui.add_sized(
-                    [360.0, 120.0],
-                    egui::Button::new(RichText::new("I hear it  [Space]").size(24.0)),
-                )
-                .clicked()
-            })
-            .inner
-            || context.input(|input| input.key_pressed(egui::Key::Space));
-
-        if let Some(warning) = &self.warning {
-            ui.add_space(20.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new(warning).color(Color32::DARK_RED));
-                ui.label("Restore the original output and volume, then resume. The current presentation was discarded.");
-            });
-        }
-
-        if heard {
+        if controls.heard {
             match self.phase {
                 RunPhase::Playing { started, .. } | RunPhase::ResponseWindow { started, .. } => {
                     let latency = now
@@ -748,34 +847,22 @@ impl TestRun {
             }
         }
 
-        ui.add_space(30.0);
-        let mut abandon = false;
-        ui.horizontal(|ui| {
-            if matches!(self.phase, RunPhase::Paused) {
-                if ui.button("Check setup and resume").clicked() {
-                    if self.volume_matches() {
-                        self.warning = None;
-                        self.phase = RunPhase::Waiting(Instant::now() + Duration::from_secs(1));
-                    } else {
-                        self.warning = Some(
-                            "The Linux output volume still differs from the start of the test."
-                                .into(),
-                        );
-                    }
-                }
-            } else if ui.button("Pause").clicked() {
-                self.audio.stop();
-                self.pending = None;
-                if let Some(engine) = &mut self.engine {
-                    engine.cancel_pending();
-                }
-                self.phase = RunPhase::Paused;
+        if controls.resume {
+            if self.volume_matches() {
+                self.warning = None;
+                self.phase = RunPhase::Waiting(Instant::now() + Duration::from_secs(1));
+            } else {
+                self.warning = Some(Text::VolumeStillChanged.into());
             }
-            if ui.button("Abandon test").clicked() {
-                abandon = true;
+        } else if controls.pause {
+            self.audio.stop();
+            self.pending = None;
+            if let Some(engine) = &mut self.engine {
+                engine.cancel_pending();
             }
-        });
-        if abandon {
+            self.phase = RunPhase::Paused;
+        }
+        if controls.abandon {
             self.audio.stop();
             self.session.status = SessionStatus::Abandoned;
             return TestAction::Abandoned(self.session.clone());
@@ -816,7 +903,7 @@ impl TestRun {
                     if let Some(engine) = &mut self.engine {
                         engine.cancel_pending();
                     }
-                    self.warning = Some(format!("Audio stopped: {error}"));
+                    self.warning = Some(LocalizedText::with(Text::AudioStopped, [error]));
                     self.phase = RunPhase::Paused;
                 }
             }
@@ -825,7 +912,7 @@ impl TestRun {
 
     fn schedule_presentation(&mut self) {
         if !self.volume_matches() {
-            self.warning = Some("The Linux output volume changed during the test.".into());
+            self.warning = Some(Text::VolumeChanged.into());
             self.phase = RunPhase::Paused;
             return;
         }
@@ -859,7 +946,7 @@ impl TestRun {
                 };
             }
             Err(error) => {
-                self.warning = Some(error.to_string());
+                self.warning = Some(error.into());
                 self.phase = RunPhase::Paused;
             }
         }
@@ -874,15 +961,15 @@ impl TestRun {
             if let Some(engine) = &mut self.engine {
                 engine.cancel_pending();
             }
-            self.warning = Some("The Linux output volume changed during the presentation.".into());
+            self.warning = Some(Text::PresentationVolumeChanged.into());
             self.phase = RunPhase::Paused;
             return TestAction::None;
         }
         let Some(engine) = &mut self.engine else {
             return TestAction::None;
         };
-        if let Err(error) = engine.record_response(heard, latency) {
-            self.warning = Some(error.into());
+        if engine.record_response(heard, latency).is_err() {
+            self.warning = Some(Text::NoPending.into());
             self.phase = RunPhase::Paused;
             return TestAction::None;
         }
@@ -894,10 +981,7 @@ impl TestRun {
             };
             if self.session.setup.sink_volume_percent.is_none() {
                 quality.high_confidence = false;
-                quality.reasons.push(
-                    "Linux output volume was unavailable, so setup matching cannot be verified"
-                        .into(),
-                );
+                quality.reasons.push(QualityIssue::VolumeUnavailable.into());
             }
             self.session.thresholds = thresholds;
             self.session.trials = trials;
@@ -926,7 +1010,65 @@ impl TestRun {
     }
 }
 
-fn audiogram(ui: &mut egui::Ui, session: &TestSession, baseline: Option<&TestSession>) {
+#[derive(Default)]
+struct TestControls {
+    heard: bool,
+    pause: bool,
+    resume: bool,
+    abandon: bool,
+}
+
+fn test_controls(
+    ui: &mut egui::Ui,
+    context: &egui::Context,
+    language: Language,
+    allow_space: bool,
+    progress: f32,
+    warning: Option<&LocalizedText>,
+    paused: bool,
+) -> TestControls {
+    let mut controls = TestControls::default();
+    ui.vertical_centered(|ui| {
+        ui.add_space(45.0);
+        ui.heading(language.text(Text::ListenHeading));
+        ui.label(language.text(Text::ListenHelp));
+        ui.add_space(20.0);
+        ui.add(egui::ProgressBar::new(progress).desired_width(500.0));
+        ui.label(language.format(Text::Progress, &[language.number(progress * 100.0, 0)]));
+        ui.add_space(45.0);
+        controls.heard = ui
+            .add_sized(
+                [ui.available_width().min(520.0), 120.0],
+                egui::Button::new(RichText::new(language.text(Text::HearIt)).size(24.0)),
+            )
+            .clicked();
+    });
+    controls.heard |= allow_space && context.input(|input| input.key_pressed(egui::Key::Space));
+    if let Some(warning) = warning {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(warning.render(language)).color(Color32::DARK_RED));
+            ui.label(language.text(Text::RestoreSetup));
+        });
+    }
+    ui.add_space(30.0);
+    ui.horizontal(|ui| {
+        if paused {
+            controls.resume = ui.button(language.text(Text::Resume)).clicked();
+        } else {
+            controls.pause = ui.button(language.text(Text::Pause)).clicked();
+        }
+        controls.abandon = ui.button(language.text(Text::Abandon)).clicked();
+    });
+    controls
+}
+
+fn audiogram(
+    ui: &mut egui::Ui,
+    session: &TestSession,
+    baseline: Option<&TestSession>,
+    language: Language,
+) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 350.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, Color32::from_rgb(250, 251, 252));
@@ -979,20 +1121,20 @@ fn audiogram(ui: &mut egui::Ui, session: &TestSession, baseline: Option<&TestSes
         FontId::proportional(12.0),
         Color32::DARK_GRAY,
     );
-    painter.text(
-        Pos2::new(plot.center().x, rect.bottom() - 12.0),
-        Align2::CENTER_CENTER,
-        "Frequency (Hz)  •  lower dB-R means a quieter digital tone was heard",
-        FontId::proportional(12.0),
-        Color32::DARK_GRAY,
-    );
     if let Some(baseline) = baseline {
-        draw_screen_curves(&painter, plot, baseline, true);
+        draw_screen_curves(&painter, plot, baseline, true, language);
     }
-    draw_screen_curves(&painter, plot, session, false);
+    draw_screen_curves(&painter, plot, session, false, language);
+    ui.small(language.text(Text::ChartCaption));
 }
 
-fn draw_screen_curves(painter: &egui::Painter, plot: Rect, session: &TestSession, baseline: bool) {
+fn draw_screen_curves(
+    painter: &egui::Painter,
+    plot: Rect,
+    session: &TestSession,
+    baseline: bool,
+    language: Language,
+) {
     for ear in [Ear::Right, Ear::Left] {
         let colour = if baseline {
             Color32::GRAY
@@ -1050,7 +1192,7 @@ fn draw_screen_curves(painter: &egui::Painter, plot: Rect, session: &TestSession
                     painter.text(
                         point,
                         Align2::CENTER_CENTER,
-                        "NR↓",
+                        format!("{}↓", language.text(Text::NoResponse)),
                         FontId::proportional(12.0),
                         colour,
                     );
@@ -1078,24 +1220,35 @@ fn dashed_line(painter: &egui::Painter, start: Pos2, end: Pos2, stroke: Stroke) 
     }
 }
 
-fn threshold_table(ui: &mut egui::Ui, session: &TestSession, baseline: Option<&TestSession>) {
-    ui.horizontal(|ui| {
-        ui.colored_label(Color32::from_rgb(205, 35, 45), "○ Right ear");
-        ui.colored_label(Color32::from_rgb(30, 80, 200), "× Left ear");
+fn threshold_table(
+    ui: &mut egui::Ui,
+    session: &TestSession,
+    baseline: Option<&TestSession>,
+    language: Language,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(
+            Color32::from_rgb(205, 35, 45),
+            language.text(Text::RightLegend),
+        );
+        ui.colored_label(
+            Color32::from_rgb(30, 80, 200),
+            language.text(Text::LeftLegend),
+        );
         if baseline.is_some() {
-            ui.colored_label(Color32::GRAY, "- - matching baseline");
+            ui.colored_label(Color32::GRAY, language.text(Text::BaselineLegend));
         } else {
-            ui.label("No earlier high-confidence session with this exact setup is available.");
+            ui.label(language.text(Text::NoBaseline));
         }
     });
     egui::Grid::new("threshold_table")
         .striped(true)
         .spacing([22.0, 6.0])
         .show(ui, |ui| {
-            ui.strong("Frequency");
-            ui.strong("Right dB-R");
-            ui.strong("Left dB-R");
-            ui.strong("Ear difference");
+            ui.strong(language.text(Text::Frequency));
+            ui.strong(language.text(Text::RightThreshold));
+            ui.strong(language.text(Text::LeftThreshold));
+            ui.strong(language.text(Text::EarDifference));
             ui.end_row();
             for frequency in FREQUENCIES_HZ {
                 let right = screen_threshold(session, Ear::Right, frequency);
@@ -1106,19 +1259,20 @@ fn threshold_table(ui: &mut egui::Ui, session: &TestSession, baseline: Option<&T
                     .unwrap_or_else(|| "--".into());
                 ui.label(format!("{frequency} Hz"));
                 ui.label(
-                    right
-                        .map(|value| format!("{value:.0}"))
-                        .unwrap_or_else(|| "NR".into()),
+                    right.map(|value| format!("{value:.0}")).unwrap_or_else(|| {
+                        screen_outcome(session, Ear::Right, frequency, language)
+                    }),
                 );
                 ui.label(
                     left.map(|value| format!("{value:.0}"))
-                        .unwrap_or_else(|| "NR".into()),
+                        .unwrap_or_else(|| screen_outcome(session, Ear::Left, frequency, language)),
                 );
                 ui.label(difference);
                 ui.end_row();
             }
         });
-    ui.small("dB-R is an app-defined digital relative scale: 0 = -90 dBFS and 60 = -30 dBFS. It is not clinical dB HL or sound-pressure level.");
+    ui.small(language.text(Text::NoResponseHelp));
+    ui.small(language.text(Text::RelativeScale));
 }
 
 fn screen_threshold(session: &TestSession, ear: Ear, frequency: u32) -> Option<f32> {
@@ -1127,12 +1281,453 @@ fn screen_threshold(session: &TestSession, ear: Ear, frequency: u32) -> Option<f
         .and_then(|threshold| threshold.relative_db())
 }
 
-fn date_label(session: &TestSession) -> String {
-    let date = session.started_at.date();
-    format!(
-        "{:04}-{:02}-{:02}",
-        date.year(),
-        u8::from(date.month()),
-        date.day()
-    )
+fn screen_outcome(session: &TestSession, ear: Ear, frequency: u32, language: Language) -> String {
+    if session
+        .threshold(ear, frequency)
+        .is_some_and(|threshold| threshold.outcome == ThresholdOutcome::NoResponse)
+    {
+        language.text(Text::NoResponse).into()
+    } else {
+        "--".into()
+    }
+}
+
+fn hearing_shortcut_allowed(
+    was_open: bool,
+    is_open: bool,
+    selector_focused: bool,
+    message_open: bool,
+) -> bool {
+    !was_open && !is_open && !selector_focused && !message_open
+}
+
+impl eframe::App for HearingApp {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(root_ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{QualityAssessment, Threshold};
+    use egui::epaint::{ClippedShape, Shape};
+
+    fn sample_app(repository: Option<SessionRepository>) -> HearingApp {
+        let setup = AudioSetup {
+            device_id: "test".into(),
+            device_name: "AirPods Pro".into(),
+            backend: "ALSA".into(),
+            sample_rate: 48_000,
+            channels: 2,
+            sink_volume_percent: Some(50.0),
+            listening_mode: "Noise cancellation".into(),
+            ceiling_dbfs: CEILING_DBFS,
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let mut session = TestSession::new(setup);
+        session.status = SessionStatus::Completed;
+        session.quality = Some(QualityAssessment {
+            high_confidence: true,
+            catch_trials: 6,
+            false_positive_catches: 0,
+            max_retest_difference_db: 0.0,
+            reasons: vec![],
+        });
+        for ear in [Ear::Right, Ear::Left] {
+            for frequency_hz in FREQUENCIES_HZ {
+                session.thresholds.push(Threshold {
+                    ear,
+                    frequency_hz,
+                    dbfs: Some(-60.0),
+                    outcome: ThresholdOutcome::Measured,
+                });
+            }
+        }
+        HearingApp {
+            repository,
+            sessions: vec![session],
+            page: Page::Dashboard,
+            setup: SetupState::default(),
+            running: None,
+            display_name: "Jörg Weiß".into(),
+            language: Language::English,
+            message: None,
+            delete_confirmation: None,
+        }
+    }
+
+    fn input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(850.0, 620.0))),
+            ..Default::default()
+        }
+    }
+
+    fn visit_text(shape: &Shape, visit: &mut impl FnMut(&egui::epaint::TextShape)) {
+        match shape {
+            Shape::Text(text) => visit(text),
+            Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit_text(shape, visit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visible_text(shapes: &[ClippedShape]) -> String {
+        let mut values = Vec::new();
+        for shape in shapes {
+            visit_text(&shape.shape, &mut |text| {
+                let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                if bounds.intersects(shape.clip_rect) {
+                    assert!(
+                        bounds.min.x >= -1.0 && bounds.max.x <= 851.0,
+                        "text exceeds minimum window width: {} at {bounds:?}",
+                        text.galley.job.text
+                    );
+                    values.push(text.galley.job.text.clone());
+                }
+            });
+        }
+        values.join("\n")
+    }
+
+    #[test]
+    fn switching_language_preserves_setup_and_handles_save_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = SessionRepository::open(directory.path().join("test.sqlite")).unwrap();
+        let mut app = sample_app(Some(repository));
+        app.page = Page::Setup;
+        app.setup.quiet_room = true;
+        app.setup.noise_cancellation = true;
+        app.setup.processing_off = true;
+        app.setup.comfortable = true;
+        app.setup.first_ear = Ear::Left;
+        let original = serde_json::to_string(&app.sessions).unwrap();
+        app.set_language(Language::German);
+        assert_eq!(app.page, Page::Setup);
+        assert!(
+            app.setup.quiet_room
+                && app.setup.noise_cancellation
+                && app.setup.processing_off
+                && app.setup.comfortable
+        );
+        assert_eq!(app.setup.first_ear, Ear::Left);
+        assert_eq!(app.display_name, "Jörg Weiß");
+        assert_eq!(serde_json::to_string(&app.sessions).unwrap(), original);
+        assert_eq!(
+            app.repository
+                .as_ref()
+                .unwrap()
+                .preference("language")
+                .unwrap()
+                .as_deref(),
+            Some("de")
+        );
+        // An existing database can become unwritable after startup.
+        let failing = SessionRepository::open(directory.path().join("readonly.sqlite")).unwrap();
+        failing.make_read_only_for_test();
+        app.repository = Some(failing);
+        app.set_language(Language::English);
+        assert_eq!(app.language, Language::English);
+        assert!(
+            app.message
+                .as_ref()
+                .unwrap()
+                .text
+                .render(app.language)
+                .contains("could not be saved")
+        );
+        app.set_language(Language::German);
+        assert!(
+            app.message
+                .as_ref()
+                .unwrap()
+                .text
+                .render(app.language)
+                .contains("konnte aber nicht gespeichert werden")
+        );
+    }
+
+    #[test]
+    fn minimum_window_renders_all_pages_and_translated_dialogs() {
+        for language in [Language::English, Language::German] {
+            for page in [
+                "dashboard",
+                "setup",
+                "setup-end",
+                "results",
+                "results-end",
+                "message",
+                "delete",
+            ] {
+                let mut app = sample_app(None);
+                app.language = language;
+                app.setup.devices.push(AudioDeviceInfo {
+                    id: "test".into(),
+                    name: "AirPods Pro".into(),
+                    backend: "ALSA".into(),
+                    sample_rate: 48_000,
+                    channels: 2,
+                });
+                app.setup.volume = Some(50.0);
+                app.page = match page {
+                    "setup" | "setup-end" => Page::Setup,
+                    "results" | "results-end" | "delete" => Page::Results(app.sessions[0].id),
+                    _ => Page::Dashboard,
+                };
+                if page == "message" {
+                    app.info(Text::BaselineUpdated);
+                }
+                if page == "delete" {
+                    app.delete_confirmation = Some(app.sessions[0].id);
+                }
+                let context = egui::Context::default();
+                context.set_theme(egui::Theme::Light);
+                context.style_mut_of(egui::Theme::Light, |style| {
+                    style.spacing.button_padding = Vec2::new(14.0, 8.0)
+                });
+                let mut deltas = Vec::new();
+                let mut output = None;
+                for pass in 0..5 {
+                    let mut raw = input();
+                    raw.time = Some(pass as f64 * 0.25);
+                    if page.ends_with("-end") && pass > 1 {
+                        raw.events = vec![
+                            egui::Event::PointerMoved(Pos2::new(400.0, 300.0)),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                phase: egui::TouchPhase::Move,
+                                delta: Vec2::new(0.0, -800.0),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ];
+                    }
+                    let frame = context.run_ui(raw, |ui| app.draw(ui));
+                    deltas.extend(frame.textures_delta.set.clone());
+                    output = Some(frame);
+                }
+                let output = output.unwrap();
+                let text = visible_text(&output.shapes);
+                assert!(text.contains(language.name()));
+                assert!(
+                    text.contains(language.text(Text::UrgentWarning)),
+                    "footer not visible: {text}"
+                );
+                match page {
+                    "dashboard" => assert!(text.contains(language.text(Text::History))),
+                    "setup" => assert!(text.contains(language.text(Text::SetupHeading))),
+                    "setup-end" => assert!(text.contains(language.text(Text::Duration))),
+                    "results-end" => assert!(text.contains(language.text(Text::RelativeScale))),
+                    "results" => assert!(text.contains(language.text(Text::HighConfidence))),
+                    "message" => assert!(text.contains(language.text(Text::BaselineUpdated))),
+                    "delete" => assert!(text.contains(language.text(Text::DeleteQuestion))),
+                    _ => unreachable!(),
+                }
+                export_preview(
+                    &context,
+                    &output,
+                    deltas,
+                    &format!("{page}-{}", language.code()),
+                );
+            }
+        }
+    }
+
+    fn text_center(output: &egui::FullOutput, value: &str) -> Pos2 {
+        let mut center = None;
+        for shape in &output.shapes {
+            visit_text(&shape.shape, &mut |text| {
+                if text.galley.job.text == value {
+                    center = Some(text.galley.rect.translate(text.pos.to_vec2()).center());
+                }
+            });
+        }
+        center.unwrap_or_else(|| panic!("missing UI text: {value}"))
+    }
+
+    fn click(app: &mut HearingApp, context: &egui::Context, position: Pos2) -> egui::FullOutput {
+        let mut output = None;
+        for pressed in [true, false] {
+            let mut raw = input();
+            raw.events = vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            output = Some(context.run_ui(raw, |ui| app.draw(ui)));
+        }
+        output.unwrap()
+    }
+
+    #[test]
+    fn dropdown_switches_an_open_dialog_and_persists_the_choice() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.sqlite");
+        let repository = SessionRepository::open(&path).unwrap();
+        let mut app = sample_app(Some(repository));
+        app.page = Page::Setup;
+        app.setup.quiet_room = true;
+        app.info(Text::BaselineUpdated);
+        let context = egui::Context::default();
+        let _ = context.run_ui(input(), |ui| app.draw(ui));
+        let first = context.run_ui(input(), |ui| app.draw(ui));
+        click(&mut app, &context, text_center(&first, "English"));
+        let opened = context.run_ui(input(), |ui| app.draw(ui));
+        assert!(
+            visible_text(&opened.shapes).contains("Deutsch"),
+            "{}",
+            visible_text(&opened.shapes)
+        );
+        click(&mut app, &context, text_center(&opened, "Deutsch"));
+        let changed = context.run_ui(input(), |ui| app.draw(ui));
+        assert_eq!(app.language, Language::German);
+        assert!(app.setup.quiet_room);
+        assert_eq!(app.page, Page::Setup);
+        assert!(
+            visible_text(&changed.shapes).contains(Language::German.text(Text::BaselineUpdated))
+        );
+        assert_eq!(app.display_name, "Jörg Weiß");
+        drop(app);
+        let reopened = SessionRepository::open(&path).unwrap();
+        assert_eq!(
+            reopened.preference("language").unwrap().as_deref(),
+            Some("de")
+        );
+    }
+
+    #[test]
+    fn language_popup_space_does_not_record_a_hearing_response() {
+        let context = egui::Context::default();
+        let mut app = sample_app(None);
+        let _ = context.run_ui(input(), |ui| {
+            app.language_selector(ui);
+        });
+        egui::Popup::open_id(&context, egui::Id::new("test_language_popup"));
+        let mut raw = input();
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: Some(egui::Key::Space),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = context.run_ui(raw, |ui| {
+            let allow_space = app.language_selector(ui);
+            let controls = test_controls(ui, &context, app.language, allow_space, 0.5, None, false);
+            assert!(!controls.heard);
+        });
+        egui::Popup::close_all(&context);
+        let mut raw = input();
+        raw.events = vec![egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: Some(egui::Key::Space),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        let _ = context.run_ui(raw, |ui| {
+            let controls = test_controls(ui, &context, Language::German, true, 0.5, None, false);
+            assert!(controls.heard);
+        });
+    }
+
+    #[test]
+    fn running_and_paused_controls_fit_and_translate_warnings() {
+        for language in [Language::English, Language::German] {
+            for paused in [false, true] {
+                let context = egui::Context::default();
+                context.set_theme(egui::Theme::Light);
+                let warning = LocalizedText::from(Text::VolumeChanged);
+                let mut deltas = Vec::new();
+                let mut output = None;
+                for _ in 0..3 {
+                    let frame = context.run_ui(input(), |ui| {
+                        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+                            let controls = test_controls(
+                                ui,
+                                &context,
+                                language,
+                                true,
+                                0.5,
+                                paused.then_some(&warning),
+                                paused,
+                            );
+                            assert!(
+                                !controls.heard
+                                    && !controls.pause
+                                    && !controls.resume
+                                    && !controls.abandon
+                            );
+                        });
+                    });
+                    deltas.extend(frame.textures_delta.set.clone());
+                    output = Some(frame);
+                }
+                let output = output.unwrap();
+                let text = visible_text(&output.shapes);
+                assert!(text.contains(language.text(Text::HearIt)));
+                assert!(text.contains(language.text(if paused {
+                    Text::Resume
+                } else {
+                    Text::Pause
+                })));
+                if paused {
+                    assert!(text.contains(language.text(Text::VolumeChanged)));
+                }
+                export_preview(
+                    &context,
+                    &output,
+                    deltas,
+                    &format!(
+                        "test-{}-{}",
+                        if paused { "paused" } else { "running" },
+                        language.code()
+                    ),
+                );
+            }
+        }
+    }
+
+    // Optional output for visual QA, using the real egui geometry and font atlas.
+    fn export_preview(
+        context: &egui::Context,
+        output: &egui::FullOutput,
+        deltas: Vec<(egui::TextureId, egui::epaint::ImageDelta)>,
+        name: &str,
+    ) {
+        let Ok(directory) = std::env::var("HEARING_TEST_QA_DIR") else {
+            return;
+        };
+        let textures: Vec<_> = deltas
+            .into_iter()
+            .map(|(id, delta)| {
+                let egui::ImageData::Color(image) = delta.image;
+                serde_json::json!({"id": format!("{id:?}"), "size": image.size, "pos": delta.pos,
+                "pixels": image.pixels.iter().map(Color32::to_array).collect::<Vec<_>>()})
+            })
+            .collect();
+        let meshes: Vec<_> = context.tessellate(output.shapes.clone(), output.pixels_per_point).into_iter().filter_map(|primitive| {
+            let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else { return None; };
+            Some(serde_json::json!({"texture": format!("{:?}", mesh.texture_id),
+                "clip": [primitive.clip_rect.min.x, primitive.clip_rect.min.y, primitive.clip_rect.max.x, primitive.clip_rect.max.y],
+                "indices": mesh.indices,
+                "vertices": mesh.vertices.iter().map(|vertex| serde_json::json!({"pos": [vertex.pos.x, vertex.pos.y], "uv": [vertex.uv.x, vertex.uv.y], "color": vertex.color.to_array()})).collect::<Vec<_>>() }))
+        }).collect();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            std::path::Path::new(&directory).join(format!("{name}.json")),
+            serde_json::to_vec(
+                &serde_json::json!({"size": [850, 620], "textures": textures, "meshes": meshes}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
 }
