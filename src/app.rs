@@ -7,6 +7,7 @@ use crate::domain::{
 };
 use crate::localization::{Language, LocalizedText, Text};
 use crate::report;
+use crate::sound_check::{CheckPhase, CheckResponse, SoundCheck};
 use crate::storage::SessionRepository;
 use crate::test_engine::{Presentation, TestEngine};
 use crate::theme;
@@ -51,7 +52,9 @@ struct SetupState {
     quiet_room: bool,
     noise_cancellation: bool,
     processing_off: bool,
-    comfortable: bool,
+    sound_check: SoundCheck,
+    sound_warning: Option<Text>,
+    volume_polled_at: Option<Instant>,
     first_ear: Ear,
     volume: Option<f32>,
     next_token: u64,
@@ -80,14 +83,14 @@ impl SetupState {
             && self.quiet_room
             && self.noise_cancellation
             && self.processing_off
-            && self.comfortable
+            && self.sound_check.ready()
     }
 
     fn can_continue(&self) -> bool {
         match self.step {
             SetupStep::Device => self.devices.get(self.selected_device).is_some(),
             SetupStep::Room => self.quiet_room && self.noise_cancellation && self.processing_off,
-            SetupStep::Sound => self.comfortable,
+            SetupStep::Sound => self.sound_check.ready(),
             SetupStep::Ready => self.ready(),
         }
     }
@@ -103,7 +106,9 @@ impl Default for SetupState {
             quiet_room: false,
             noise_cancellation: false,
             processing_off: false,
-            comfortable: false,
+            sound_check: SoundCheck::default(),
+            sound_warning: None,
+            volume_polled_at: None,
             first_ear: Ear::Right,
             volume: None,
             next_token: 1,
@@ -121,6 +126,7 @@ struct TestRun {
     real_since_catch: u32,
     catch_after: u32,
     warning: Option<LocalizedText>,
+    floor_limit: Option<(Ear, u32)>,
 }
 
 enum RunPhase {
@@ -135,6 +141,7 @@ enum TestAction {
     SaveProgress,
     Completed(TestSession),
     Abandoned(TestSession),
+    RestartSetup(TestSession),
 }
 
 impl HearingApp {
@@ -265,7 +272,8 @@ impl HearingApp {
                     .unwrap_or(0);
                 self.setup.volume = system_output_volume_percent();
                 self.setup.audio = None;
-                self.setup.comfortable = false;
+                self.setup.sound_check = SoundCheck::default();
+                self.setup.sound_warning = None;
             }
             Err(error) => self.error(error),
         }
@@ -291,29 +299,205 @@ impl HearingApp {
         }
     }
 
-    fn play_setup_tone(&mut self, ear: Ear) {
+    fn refresh_setup_volume(&mut self) -> bool {
+        let current = system_output_volume_percent();
+        self.setup.volume = current;
+        self.setup.volume_polled_at = Some(Instant::now());
+        if self.setup.sound_check.observe_volume(current) {
+            if let Some(audio) = &self.setup.audio {
+                audio.stop();
+            }
+            self.setup.sound_warning = Some(Text::SetupVolumeChanged);
+            if self.setup.step == SetupStep::Ready {
+                self.setup.step = SetupStep::Sound;
+            }
+            return false;
+        }
+        true
+    }
+
+    fn poll_setup_audio(&mut self, context: &egui::Context) {
+        context.request_repaint_after(Duration::from_millis(100));
+        if self
+            .setup
+            .volume_polled_at
+            .is_none_or(|last| last.elapsed() >= Duration::from_millis(500))
+        {
+            self.refresh_setup_volume();
+        }
+        let mut error = None;
+        if let Some(audio) = &self.setup.audio {
+            while let Some(event) = audio.try_event() {
+                match event {
+                    AudioEvent::Finished(token) => self.setup.sound_check.finished(token),
+                    AudioEvent::Error(value) => error = Some(value),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(error) = error {
+            self.reset_sound_check(None);
+            self.setup.audio = None;
+            self.error(LocalizedText::with(Text::AudioStopped, [error]));
+        }
+    }
+
+    fn play_setup_tone(&mut self) {
+        if !self.refresh_setup_volume() {
+            return;
+        }
         if !self.prepare_audio() {
             return;
         }
         let token = self.setup.next_token;
         self.setup.next_token += 1;
+        let Some(request) = self.setup.sound_check.begin(token, self.setup.volume) else {
+            return;
+        };
         if let Some(audio) = &self.setup.audio
-            && let Err(error) = audio.play(ToneRequest {
-                token,
-                ear,
-                frequency_hz: 1_000,
-                dbfs: Some(CEILING_DBFS),
-            })
+            && let Err(error) = audio.play(request)
         {
+            self.setup.sound_check = SoundCheck::default();
             self.error(error);
         }
     }
 
+    fn answer_setup_tone(&mut self, response: CheckResponse) {
+        if self.refresh_setup_volume() {
+            self.setup.sound_check.answer(response);
+        }
+    }
+
+    fn reset_sound_check(&mut self, warning: Option<Text>) {
+        if let Some(audio) = &self.setup.audio {
+            audio.stop();
+        }
+        self.setup.sound_check = SoundCheck::default();
+        self.setup.sound_warning = warning;
+        if self.setup.step == SetupStep::Ready {
+            self.setup.step = SetupStep::Sound;
+        }
+    }
+
+    fn sound_check_ui(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        if let Some(warning) = self.setup.sound_warning {
+            ui.label(RichText::new(language.text(warning)).color(theme::AMBER));
+        }
+        if let Some((ear, frequency, reference)) = self.setup.sound_check.point() {
+            ui.strong(
+                language.format(
+                    if reference {
+                        Text::CheckReference
+                    } else {
+                        Text::CheckQuiet
+                    },
+                    &[
+                        language
+                            .text(if ear == Ear::Left {
+                                Text::LeftEar
+                            } else {
+                                Text::RightEar
+                            })
+                            .into(),
+                        frequency.to_string(),
+                    ],
+                ),
+            );
+            if reference {
+                theme::muted(ui, language.text(Text::ReferencePrompt));
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        !matches!(self.setup.sound_check.phase, CheckPhase::Playing(_)),
+                        egui::Button::new(language.text(Text::PlayCheckTone)),
+                    )
+                    .clicked()
+                {
+                    self.play_setup_tone();
+                }
+                if reference
+                    && ui
+                        .add_enabled(
+                            self.setup.sound_check.phase != CheckPhase::Idle,
+                            egui::Button::new(language.text(Text::TooLoud)),
+                        )
+                        .clicked()
+                {
+                    self.reset_sound_check(Some(Text::ReferenceRetry));
+                }
+            });
+            if matches!(self.setup.sound_check.phase, CheckPhase::Playing(_)) {
+                ui.small(language.text(Text::CheckPlaying));
+            }
+            ui.add_enabled_ui(
+                self.setup.sound_check.phase == CheckPhase::AwaitingResponse,
+                |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .button(language.text(if reference {
+                                Text::ReferenceHeard
+                            } else {
+                                Text::QuietHeard
+                            }))
+                            .clicked()
+                        {
+                            self.answer_setup_tone(if reference {
+                                CheckResponse::Comfortable
+                            } else {
+                                CheckResponse::Heard
+                            });
+                        }
+                        if ui.button(language.text(Text::NotHeard)).clicked() {
+                            self.answer_setup_tone(CheckResponse::NotHeard);
+                        }
+                    });
+                },
+            );
+        } else {
+            if self.setup.sound_check.floor_heard {
+                ui.label(RichText::new(language.text(Text::LowerVolumeAdvice)).color(theme::AMBER));
+                if !self.setup.sound_check.ready()
+                    && ui.button(language.text(Text::ContinueWithLimits)).clicked()
+                    && self.refresh_setup_volume()
+                {
+                    self.setup.sound_check.accept_limits();
+                }
+            }
+            if self.setup.sound_check.reference_unheard {
+                ui.label(RichText::new(language.text(Text::ReferenceUnheard)).color(theme::AMBER));
+            }
+            if self.setup.sound_check.ready() {
+                ui.label(language.text(Text::SoundCheckPassed));
+            }
+            if ui.button(language.text(Text::RepeatSoundCheck)).clicked() {
+                self.reset_sound_check(None);
+            }
+            if self.setup.sound_check.floor_heard {
+                theme::muted(ui, language.text(Text::LimitedRangeHelp));
+            }
+        }
+        ui.small(match self.setup.volume {
+            Some(value) => language.format(Text::CurrentVolume, &[language.number(value, 0)]),
+            None => language.text(Text::SoundVolumeUnknown).into(),
+        });
+        egui::CollapsingHeader::new(language.text(Text::SoundCheckDetails))
+            .id_salt("sound_check_details")
+            .show(ui, |ui| {
+                theme::muted(ui, language.text(Text::SoundCheckHelp));
+                theme::muted(ui, language.text(Text::ReferenceHelp));
+            });
+    }
+
     fn start_test(&mut self) {
+        if !self.refresh_setup_volume() || !self.setup.ready() {
+            self.setup.step = SetupStep::Sound;
+            return;
+        }
         if !self.prepare_audio() {
             return;
         }
-        self.setup.volume = system_output_volume_percent();
         let audio = self.setup.audio.take().expect("audio was prepared");
         let setup = AudioSetup {
             device_id: audio.info.id.clone(),
@@ -366,6 +550,20 @@ impl HearingApp {
                 self.running = None;
                 self.refresh_sessions();
                 self.page = Page::Results(id);
+            }
+            TestAction::RestartSetup(session) => {
+                let Some(repository) = &self.repository else {
+                    self.error(Text::StorageUnavailable);
+                    return;
+                };
+                if let Err(error) = repository.save(&session) {
+                    self.error(error);
+                    return;
+                }
+                self.running = None;
+                self.refresh_sessions();
+                self.enter_setup();
+                self.setup.sound_warning = Some(Text::LowerVolumeAdvice);
             }
             TestAction::Abandoned(session) => {
                 if let Some(repository) = &self.repository
@@ -684,6 +882,7 @@ impl HearingApp {
     }
 
     fn setup_ui(&mut self, ui: &mut egui::Ui) {
+        self.poll_setup_audio(ui.ctx());
         let language = self.language;
         ui.heading(language.text(Text::SetupHeading));
         let compact = ui.ctx().content_rect().height() < 700.0;
@@ -769,7 +968,8 @@ impl HearingApp {
                                             .changed()
                                         {
                                             self.setup.audio = None;
-                                            self.setup.comfortable = false;
+                                            self.setup.sound_check = SoundCheck::default();
+                                            self.setup.sound_warning = None;
                                         }
                                     }
                                 });
@@ -816,23 +1016,16 @@ impl HearingApp {
                     }
                     SetupStep::Sound => {
                         ui.heading(language.text(Text::ReferenceStep));
-                        theme::muted(ui, language.text(Text::ReferenceHelp));
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button(language.text(Text::PlayLeft)).clicked() {
-                                self.play_setup_tone(Ear::Left);
-                            }
-                            if ui.button(language.text(Text::PlayRight)).clicked() {
-                                self.play_setup_tone(Ear::Right);
-                            }
-                        });
-                        ui.checkbox(
-                            &mut self.setup.comfortable,
-                            language.text(Text::ReferenceComfort),
-                        );
+                        self.sound_check_ui(ui);
                     }
                     SetupStep::Ready => {
                         ui.heading(language.text(Text::EarOrderStep));
+                        if self.setup.sound_check.floor_heard {
+                            theme::muted(ui, language.text(Text::LimitedRangeHelp));
+                        }
+                        if self.setup.sound_check.reference_unheard {
+                            theme::muted(ui, language.text(Text::ReferenceUnheard));
+                        }
                         theme::badge(
                             ui,
                             language.text(Text::ReadySummary),
@@ -891,6 +1084,8 @@ impl HearingApp {
                         theme::primary(language.text(Text::Continue)),
                     )
                     .clicked()
+                    && self.refresh_setup_volume()
+                    && self.setup.can_continue()
                 {
                     self.setup.step = SetupStep::ALL[self.setup.step.index() + 1];
                 }
@@ -994,6 +1189,16 @@ impl HearingApp {
                 }
             }
         });
+        if session.has_floor_limits() {
+            theme::card().inner_margin(14).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(language.text(Text::FloorResultsHelp)).color(theme::AMBER));
+                if ui.button(language.text(Text::RestartLower)).clicked() {
+                    self.enter_setup();
+                    self.setup.sound_warning = Some(Text::LowerVolumeAdvice);
+                }
+            });
+        }
         theme::card().inner_margin(16).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 8.0;
@@ -1082,6 +1287,7 @@ impl TestRun {
             real_since_catch: 0,
             catch_after: 8,
             warning: None,
+            floor_limit: None,
         }
     }
 
@@ -1111,12 +1317,16 @@ impl TestRun {
             context,
             language,
             allow_space,
-            self.engine
-                .as_ref()
-                .map(TestEngine::progress)
-                .unwrap_or(1.0),
-            self.warning.as_ref(),
-            matches!(self.phase, RunPhase::Paused),
+            ListeningState {
+                progress: self
+                    .engine
+                    .as_ref()
+                    .map(TestEngine::progress)
+                    .unwrap_or(1.0),
+                warning: self.warning.as_ref(),
+                paused: matches!(self.phase, RunPhase::Paused),
+                floor_limit: self.floor_limit,
+            },
         );
 
         if controls.heard {
@@ -1142,6 +1352,7 @@ impl TestRun {
         if controls.resume {
             if self.volume_matches() {
                 self.warning = None;
+                self.floor_limit = None;
                 self.phase = RunPhase::Waiting(Instant::now() + Duration::from_secs(1));
             } else {
                 self.warning = Some(Text::VolumeStillChanged.into());
@@ -1153,6 +1364,13 @@ impl TestRun {
                 engine.cancel_pending();
             }
             self.phase = RunPhase::Paused;
+        }
+        if controls.restart {
+            self.audio.stop();
+            self.phase = RunPhase::Paused;
+            let mut session = self.session.clone();
+            session.status = SessionStatus::Abandoned;
+            return TestAction::RestartSetup(session);
         }
         if controls.abandon {
             self.audio.stop();
@@ -1260,6 +1478,7 @@ impl TestRun {
         let Some(engine) = &mut self.engine else {
             return TestAction::None;
         };
+        let previous_progress = engine.progress();
         if engine.record_response(heard, latency).is_err() {
             self.warning = Some(Text::NoPending.into());
             self.phase = RunPhase::Paused;
@@ -1281,6 +1500,14 @@ impl TestRun {
             self.session.status = SessionStatus::Completed;
             self.session.completed_at = Some(time::OffsetDateTime::now_utc());
             return TestAction::Completed(self.session.clone());
+        }
+        if engine.progress() != previous_progress
+            && let Some(threshold) = engine.last_threshold()
+            && threshold.outcome == ThresholdOutcome::BelowFloor
+        {
+            self.floor_limit = Some((threshold.ear, threshold.frequency_hz));
+            self.phase = RunPhase::Paused;
+            return TestAction::SaveProgress;
         }
         self.phase = RunPhase::Waiting(Instant::now() + self.random_wait());
         TestAction::SaveProgress
@@ -1308,6 +1535,7 @@ struct TestControls {
     pause: bool,
     resume: bool,
     abandon: bool,
+    restart: bool,
 }
 
 fn summary_card(ui: &mut egui::Ui, value: &str, label: &str) {
@@ -1319,24 +1547,43 @@ fn summary_card(ui: &mut egui::Ui, value: &str, label: &str) {
     });
 }
 
+#[derive(Default)]
+struct ListeningState<'a> {
+    progress: f32,
+    warning: Option<&'a LocalizedText>,
+    paused: bool,
+    floor_limit: Option<(Ear, u32)>,
+}
+
 fn test_controls(
     ui: &mut egui::Ui,
     context: &egui::Context,
     language: Language,
     allow_space: bool,
-    progress: f32,
-    warning: Option<&LocalizedText>,
-    paused: bool,
+    state: ListeningState<'_>,
 ) -> TestControls {
+    let ListeningState {
+        progress,
+        warning,
+        paused,
+        floor_limit,
+    } = state;
     let mut controls = TestControls::default();
     let compact = context.content_rect().height() < 700.0;
     ui.horizontal_wrapped(|ui| {
         if paused {
             controls.resume = ui
-                .add(theme::primary(language.text(Text::Resume)))
+                .add(theme::primary(language.text(if floor_limit.is_some() {
+                    Text::ContinueOriginalVolume
+                } else {
+                    Text::Resume
+                })))
                 .clicked();
         } else {
             controls.pause = ui.button(language.text(Text::Pause)).clicked();
+        }
+        if floor_limit.is_some() {
+            controls.restart = ui.button(language.text(Text::RestartLower)).clicked();
         }
         controls.abandon = ui
             .button(RichText::new(language.text(Text::Abandon)).color(theme::MUTED))
@@ -1395,6 +1642,27 @@ fn test_controls(
         });
     controls.heard |=
         !paused && allow_space && context.input(|input| input.key_pressed(egui::Key::Space));
+    if let Some((ear, frequency)) = floor_limit {
+        ui.label(
+            RichText::new(
+                language.format(
+                    Text::FloorReached,
+                    &[
+                        language
+                            .text(if ear == Ear::Left {
+                                Text::LeftEar
+                            } else {
+                                Text::RightEar
+                            })
+                            .into(),
+                        frequency.to_string(),
+                    ],
+                ),
+            )
+            .color(theme::AMBER),
+        );
+        theme::muted(ui, language.text(Text::FloorRestartHelp));
+    }
     if let Some(warning) = warning {
         egui::Frame::new()
             .fill(theme::AMBER_BG)
@@ -1494,6 +1762,9 @@ fn audiogram(
     }
     draw_screen_curves(&painter, plot, session, false, language);
     ui.small(language.text(Text::ChartCaption));
+    if session.has_floor_limits() || baseline.is_some_and(TestSession::has_floor_limits) {
+        ui.small(language.text(Text::FloorLegend));
+    }
 }
 
 fn draw_screen_curves(
@@ -1511,59 +1782,68 @@ fn draw_screen_curves(
         } else {
             theme::BLUE
         };
-        let points: Vec<_> = FREQUENCIES_HZ
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, frequency)| {
-                session
-                    .threshold(ear, frequency)
-                    .and_then(|threshold| threshold.relative_db())
-                    .map(|level| {
-                        Pos2::new(
-                            plot.left() + index as f32 * plot.width() / 7.0,
-                            plot.top() + level.clamp(0.0, 60.0) / 60.0 * plot.height(),
-                        )
-                    })
-            })
-            .collect();
-        for pair in points.windows(2) {
-            if baseline {
-                dashed_line(painter, pair[0], pair[1], Stroke::new(1.2, colour));
-            } else {
-                painter.line_segment([pair[0], pair[1]], Stroke::new(2.0, colour));
-            }
-        }
-        if !baseline {
-            for point in points {
-                if ear == Ear::Right {
-                    painter.circle_stroke(point, 6.0, Stroke::new(2.0, colour));
+        let mut previous = None;
+        for (index, frequency) in FREQUENCIES_HZ.into_iter().enumerate() {
+            let x = plot.left() + index as f32 * plot.width() / 7.0;
+            let threshold = session.threshold(ear, frequency);
+            let point = threshold
+                .and_then(|threshold| threshold.relative_db())
+                .map(|level| {
+                    Pos2::new(
+                        x,
+                        plot.top() + level.clamp(0.0, 60.0) / 60.0 * plot.height(),
+                    )
+                });
+            if let (Some(start), Some(end)) = (previous, point) {
+                if baseline {
+                    dashed_line(painter, start, end, Stroke::new(1.2, colour));
                 } else {
-                    painter.line_segment(
-                        [point - Vec2::splat(5.0), point + Vec2::splat(5.0)],
-                        Stroke::new(2.0, colour),
-                    );
-                    painter.line_segment(
-                        [point + Vec2::new(-5.0, 5.0), point + Vec2::new(5.0, -5.0)],
-                        Stroke::new(2.0, colour),
-                    );
+                    painter.line_segment([start, end], Stroke::new(2.0, colour));
                 }
             }
-            for (index, frequency) in FREQUENCIES_HZ.into_iter().enumerate() {
-                if session
-                    .threshold(ear, frequency)
-                    .is_some_and(|threshold| threshold.outcome == ThresholdOutcome::NoResponse)
-                {
-                    let point = Pos2::new(
-                        plot.left() + index as f32 * plot.width() / 7.0,
-                        plot.bottom() - 5.0,
-                    );
-                    painter.text(
-                        point,
-                        Align2::CENTER_CENTER,
-                        format!("{}↓", language.text(Text::NoResponse)),
-                        FontId::proportional(12.0),
-                        colour,
-                    );
+            // Do not connect across an unmeasured frequency.
+            previous = point;
+            if let Some(point) = point {
+                if !baseline {
+                    if ear == Ear::Right {
+                        painter.circle_stroke(point, 6.0, Stroke::new(2.0, colour));
+                    } else {
+                        painter.line_segment(
+                            [point - Vec2::splat(5.0), point + Vec2::splat(5.0)],
+                            Stroke::new(2.0, colour),
+                        );
+                        painter.line_segment(
+                            [point + Vec2::new(-5.0, 5.0), point + Vec2::new(5.0, -5.0)],
+                            Stroke::new(2.0, colour),
+                        );
+                    }
+                }
+            } else if let Some(threshold) = threshold {
+                match threshold.outcome {
+                    ThresholdOutcome::BelowFloor => {
+                        let offset = if ear == Ear::Right { -5.0 } else { 5.0 };
+                        let tip = Pos2::new(x + offset, plot.top() + 1.0);
+                        painter.line_segment(
+                            [tip + Vec2::new(0.0, 15.0), tip],
+                            Stroke::new(2.0, colour),
+                        );
+                        for dx in [-4.0, 4.0] {
+                            painter.line_segment(
+                                [tip, tip + Vec2::new(dx, 5.0)],
+                                Stroke::new(2.0, colour),
+                            );
+                        }
+                    }
+                    ThresholdOutcome::NoResponse if !baseline => {
+                        painter.text(
+                            Pos2::new(x, plot.bottom() - 5.0),
+                            Align2::CENTER_CENTER,
+                            format!("{}↓", language.text(Text::NoResponse)),
+                            FontId::proportional(12.0),
+                            colour,
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1604,7 +1884,7 @@ fn threshold_table(ui: &mut egui::Ui, session: &TestSession, language: Language)
                 let difference = right
                     .zip(left)
                     .map(|(right, left)| format!("{:+.0} dB (R-L)", right - left))
-                    .unwrap_or_else(|| "--".into());
+                    .unwrap_or_else(|| language.text(Text::Undetermined).into());
                 ui.label(format!("{frequency} Hz"));
                 ui.label(
                     right.map(|value| format!("{value:.0}")).unwrap_or_else(|| {
@@ -1620,6 +1900,7 @@ fn threshold_table(ui: &mut egui::Ui, session: &TestSession, language: Language)
             }
         });
     ui.small(language.text(Text::NoResponseHelp));
+    ui.small(language.text(Text::FloorHelp));
 }
 
 fn screen_threshold(session: &TestSession, ear: Ear, frequency: u32) -> Option<f32> {
@@ -1629,13 +1910,13 @@ fn screen_threshold(session: &TestSession, ear: Ear, frequency: u32) -> Option<f
 }
 
 fn screen_outcome(session: &TestSession, ear: Ear, frequency: u32, language: Language) -> String {
-    if session
+    match session
         .threshold(ear, frequency)
-        .is_some_and(|threshold| threshold.outcome == ThresholdOutcome::NoResponse)
+        .map(|threshold| threshold.outcome)
     {
-        language.text(Text::NoResponse).into()
-    } else {
-        "--".into()
+        Some(ThresholdOutcome::NoResponse) => language.text(Text::NoResponse).into(),
+        Some(ThresholdOutcome::BelowFloor) => language.text(Text::AtOrBelowMinimum).into(),
+        _ => "--".into(),
     }
 }
 
@@ -1659,6 +1940,164 @@ mod tests {
     use super::*;
     use crate::domain::{QualityAssessment, Threshold};
     use egui::epaint::{ClippedShape, Shape};
+
+    fn finish_sound_check(check: &mut SoundCheck) {
+        finish_sound_check_with_floor(check, false);
+    }
+
+    fn finish_sound_check_with_floor(check: &mut SoundCheck, floor_heard: bool) {
+        while let Some((_, _, reference)) = check.point() {
+            let request = check.begin(1, system_output_volume_percent()).unwrap();
+            check.finished(request.token);
+            assert!(check.answer(if reference {
+                CheckResponse::Comfortable
+            } else if floor_heard {
+                CheckResponse::Heard
+            } else {
+                CheckResponse::NotHeard
+            }));
+        }
+    }
+
+    #[test]
+    fn limited_results_show_unknown_differences_in_both_languages() {
+        let mut app = sample_app(None);
+        for threshold in &mut app.sessions[0].thresholds {
+            if threshold.frequency_hz == 250 {
+                threshold.outcome = ThresholdOutcome::BelowFloor;
+                threshold.dbfs = Some(crate::domain::FLOOR_DBFS);
+            }
+        }
+        let session = &app.sessions[0];
+        assert!(screen_threshold(session, Ear::Left, 250).is_none());
+        assert!(screen_threshold(session, Ear::Right, 250).is_none());
+        for language in [Language::English, Language::German] {
+            let context = egui::Context::default();
+            theme::configure(&context);
+            let render = || context.run_ui(input(), |ui| threshold_table(ui, session, language));
+            render();
+            let output = render();
+            let text = visible_text(&output.shapes);
+            assert_eq!(
+                text.lines()
+                    .filter(|line| *line == language.text(Text::AtOrBelowMinimum))
+                    .count(),
+                2
+            );
+            assert!(text.contains(language.text(Text::Undetermined)), "{text}");
+        }
+    }
+
+    #[test]
+    fn restarting_saves_incomplete_work_and_preserves_the_completed_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = SessionRepository::open(directory.path().join("restart.sqlite")).unwrap();
+        let mut app = sample_app(Some(repository));
+        let completed = app.sessions[0].clone();
+        app.repository.as_ref().unwrap().save(&completed).unwrap();
+        let mut abandoned = TestSession::new(completed.setup.clone());
+        abandoned.status = SessionStatus::Abandoned;
+        abandoned.trials.push(crate::domain::Trial {
+            ordinal: 1,
+            ear: Ear::Left,
+            frequency_hz: 250,
+            dbfs: Some(crate::domain::FLOOR_DBFS),
+            is_catch: false,
+            ascending: false,
+            heard: true,
+            response_latency_ms: Some(500),
+        });
+        let id = abandoned.id;
+        app.handle_test_action(TestAction::RestartSetup(abandoned));
+        assert_eq!(app.page, Page::Setup);
+        assert!(!app.setup.ready());
+        assert_eq!(app.setup.sound_warning, Some(Text::LowerVolumeAdvice));
+        let saved = app
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .unwrap();
+        assert_eq!(saved.status, SessionStatus::Abandoned);
+        assert_eq!(saved.trials.len(), 1);
+        assert!(!saved.is_comparable_with(&completed));
+        assert_eq!(
+            app.repository
+                .as_ref()
+                .unwrap()
+                .baseline_for(&completed.setup_fingerprint)
+                .unwrap()
+                .unwrap()
+                .id,
+            completed.id
+        );
+    }
+
+    #[test]
+    fn restart_stays_on_the_current_test_if_progress_cannot_be_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let failing = SessionRepository::open(directory.path().join("readonly.sqlite")).unwrap();
+        failing.make_read_only_for_test();
+        for repository in [None, Some(failing)] {
+            let mut app = sample_app(repository);
+            app.page = Page::Test;
+            let mut abandoned = TestSession::new(app.sessions[0].setup.clone());
+            abandoned.status = SessionStatus::Abandoned;
+            app.handle_test_action(TestAction::RestartSetup(abandoned));
+            assert_eq!(app.page, Page::Test);
+            assert!(app.message.as_ref().is_some_and(|message| message.error));
+            assert_eq!(app.sessions.len(), 1);
+        }
+    }
+
+    #[test]
+    fn floor_pause_offers_restart_and_blocks_hearing_responses() {
+        for language in [Language::English, Language::German] {
+            let context = egui::Context::default();
+            theme::configure(&context);
+            let render = |raw| {
+                context.run_ui(raw, |ui| {
+                    let controls = test_controls(
+                        ui,
+                        &context,
+                        language,
+                        true,
+                        ListeningState {
+                            progress: 0.5,
+                            paused: true,
+                            floor_limit: Some((Ear::Left, 250)),
+                            ..Default::default()
+                        },
+                    );
+                    assert!(!controls.heard);
+                })
+            };
+            let first = render(input());
+            let mut raw = input();
+            raw.events.push(egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: Some(egui::Key::Space),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let output = render(raw);
+            let text = visible_text(&output.shapes);
+            assert!(text.contains(language.text(Text::RestartLower)));
+            assert!(text.contains(language.text(Text::ContinueOriginalVolume)));
+            assert!(text.contains(language.text(Text::FloorRestartHelp)));
+            export_preview(
+                &context,
+                &output,
+                first
+                    .textures_delta
+                    .set
+                    .into_iter()
+                    .chain(output.textures_delta.set.clone())
+                    .collect(),
+                &format!("floor-pause-{}", language.code()),
+            );
+        }
+    }
 
     fn sample_app(repository: Option<SessionRepository>) -> HearingApp {
         let setup = AudioSetup {
@@ -1754,7 +2193,7 @@ mod tests {
         app.setup.quiet_room = true;
         app.setup.noise_cancellation = true;
         app.setup.processing_off = true;
-        app.setup.comfortable = true;
+        finish_sound_check(&mut app.setup.sound_check);
         app.setup.first_ear = Ear::Left;
         app.setup.step = SetupStep::Sound;
         let original = serde_json::to_string(&app.sessions).unwrap();
@@ -1765,7 +2204,7 @@ mod tests {
             app.setup.quiet_room
                 && app.setup.noise_cancellation
                 && app.setup.processing_off
-                && app.setup.comfortable
+                && app.setup.sound_check.ready()
         );
         assert_eq!(app.setup.first_ear, Ear::Left);
         assert_eq!(app.display_name, "Jörg Weiß");
@@ -1814,9 +2253,13 @@ mod tests {
                     "setup",
                     "setup-room",
                     "setup-sound",
+                    "setup-quiet",
+                    "setup-limits",
                     "setup-ready",
                     "setup-end",
                     "results",
+                    "results-limits",
+                    "results-limits-end",
                     "results-end",
                     "message",
                     "delete",
@@ -1832,10 +2275,10 @@ mod tests {
                     });
                     app.setup.volume = Some(50.0);
                     app.page = match page {
-                        "setup" | "setup-room" | "setup-sound" | "setup-ready" | "setup-end" => {
-                            Page::Setup
-                        }
-                        "results" | "results-end" | "delete" => Page::Results(app.sessions[0].id),
+                        "setup" | "setup-room" | "setup-sound" | "setup-quiet" | "setup-limits"
+                        | "setup-ready" | "setup-end" => Page::Setup,
+                        "results" | "results-end" | "results-limits" | "results-limits-end"
+                        | "delete" => Page::Results(app.sessions[0].id),
                         _ => Page::Dashboard,
                     };
                     if page == "empty-dashboard" {
@@ -1843,15 +2286,35 @@ mod tests {
                     }
                     app.setup.step = match page {
                         "setup-room" => SetupStep::Room,
-                        "setup-sound" => SetupStep::Sound,
+                        "setup-sound" | "setup-quiet" | "setup-limits" => SetupStep::Sound,
                         "setup-ready" | "setup-end" => SetupStep::Ready,
                         _ => SetupStep::Device,
                     };
+                    if page == "setup-quiet" {
+                        for token in [1, 2] {
+                            app.setup
+                                .sound_check
+                                .begin(token, system_output_volume_percent());
+                            app.setup.sound_check.finished(token);
+                            app.setup.sound_check.answer(CheckResponse::Comfortable);
+                        }
+                    }
+                    if page == "setup-limits" {
+                        finish_sound_check_with_floor(&mut app.setup.sound_check, true);
+                    }
+                    if page.starts_with("results-limits") {
+                        for threshold in &mut app.sessions[0].thresholds {
+                            if threshold.frequency_hz == 250 {
+                                threshold.outcome = ThresholdOutcome::BelowFloor;
+                                threshold.dbfs = Some(crate::domain::FLOOR_DBFS);
+                            }
+                        }
+                    }
                     if matches!(app.setup.step, SetupStep::Ready) {
                         app.setup.quiet_room = true;
                         app.setup.noise_cancellation = true;
                         app.setup.processing_off = true;
-                        app.setup.comfortable = true;
+                        finish_sound_check(&mut app.setup.sound_check);
                     }
                     if page == "message" {
                         app.info(Text::BaselineUpdated);
@@ -1892,15 +2355,20 @@ mod tests {
                     );
                     match page {
                         "dashboard" => assert!(text.contains(language.text(Text::History))),
-                        "setup" | "setup-room" | "setup-sound" | "setup-ready" => {
+                        "setup" | "setup-room" | "setup-sound" | "setup-quiet" | "setup-limits"
+                        | "setup-ready" => {
                             assert!(text.contains(language.text(Text::SetupHeading)))
                         }
                         "empty-dashboard" => {
                             assert!(text.contains(language.text(Text::FirstCheck)))
                         }
                         "setup-end" => assert!(text.contains(language.text(Text::Duration))),
-                        "results-end" => assert!(text.contains(language.text(Text::RelativeScale))),
-                        "results" => assert!(text.contains(language.text(Text::HighConfidence))),
+                        "results-end" | "results-limits-end" => {
+                            assert!(text.contains(language.text(Text::RelativeScale)))
+                        }
+                        "results" | "results-limits" => {
+                            assert!(text.contains(language.text(Text::HighConfidence)))
+                        }
                         "message" => assert!(text.contains(language.text(Text::BaselineUpdated))),
                         "delete" => assert!(text.contains(language.text(Text::DeleteQuestion))),
                         _ => unreachable!(),
@@ -2024,12 +2492,7 @@ mod tests {
                 text_center(&output, language.text(Text::Continue)),
             );
             assert_eq!(app.setup.step, SetupStep::Sound);
-            let output = render(&mut app);
-            click(
-                &mut app,
-                &context,
-                text_center(&output, language.text(Text::ReferenceComfort)),
-            );
+            finish_sound_check(&mut app.setup.sound_check);
             let output = render(&mut app);
             click(
                 &mut app,
@@ -2055,12 +2518,12 @@ mod tests {
             assert!(app.setup.ready());
             assert_eq!(app.setup.first_ear, Ear::Left);
 
-            // Changing the reference confirmation prevents advancing again.
+            // Repeating the sound check prevents advancing until both ears are checked again.
             let output = render(&mut app);
             click(
                 &mut app,
                 &context,
-                text_center(&output, language.text(Text::ReferenceComfort)),
+                text_center(&output, language.text(Text::RepeatSoundCheck)),
             );
             let output = render(&mut app);
             click(
@@ -2070,6 +2533,52 @@ mod tests {
             );
             assert_eq!(app.setup.step, SetupStep::Sound);
             assert!(!app.setup.ready());
+        }
+    }
+
+    #[test]
+    fn sound_check_ui_requires_playback_and_answers_for_each_ear() {
+        for language in [Language::English, Language::German] {
+            let mut app = sample_app(None);
+            app.language = language;
+            app.page = Page::Setup;
+            app.setup.step = SetupStep::Sound;
+            let context = egui::Context::default();
+            theme::configure(&context);
+            let render = |app: &mut HearingApp| {
+                let _ = context.run_ui(input(), |ui| app.draw(ui));
+                context.run_ui(input(), |ui| app.draw(ui))
+            };
+            while let Some((ear, frequency, reference)) = app.setup.sound_check.point() {
+                // Simulate the audio transport while exercising actual UI
+                // answers and volume validation, without playing real tones.
+                let request = app
+                    .setup
+                    .sound_check
+                    .begin(1, system_output_volume_percent())
+                    .unwrap();
+                assert_eq!((request.ear, request.frequency_hz), (ear, frequency));
+                let output = render(&mut app);
+                let answer = language.text(if reference {
+                    Text::ReferenceHeard
+                } else {
+                    Text::NotHeard
+                });
+                click(&mut app, &context, text_center(&output, answer));
+                assert_eq!(
+                    app.setup.sound_check.point(),
+                    Some((ear, frequency, reference))
+                );
+                assert!(!app.setup.can_continue());
+                app.setup.sound_check.finished(request.token);
+                let output = render(&mut app);
+                click(&mut app, &context, text_center(&output, answer));
+                assert_ne!(
+                    app.setup.sound_check.point(),
+                    Some((ear, frequency, reference))
+                );
+            }
+            assert!(app.setup.can_continue());
         }
     }
 
@@ -2086,7 +2595,17 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         });
         let _ = context.run_ui(raw, |ui| {
-            let controls = test_controls(ui, &context, Language::English, true, 0.5, None, true);
+            let controls = test_controls(
+                ui,
+                &context,
+                Language::English,
+                true,
+                ListeningState {
+                    progress: 0.5,
+                    paused: true,
+                    ..Default::default()
+                },
+            );
             assert!(!controls.heard);
         });
     }
@@ -2147,7 +2666,16 @@ mod tests {
         });
         let _ = context.run_ui(raw, |ui| {
             let allow_space = app.language_selector(ui);
-            let controls = test_controls(ui, &context, app.language, allow_space, 0.5, None, false);
+            let controls = test_controls(
+                ui,
+                &context,
+                app.language,
+                allow_space,
+                ListeningState {
+                    progress: 0.5,
+                    ..Default::default()
+                },
+            );
             assert!(!controls.heard);
         });
         egui::Popup::close_all(&context);
@@ -2160,7 +2688,16 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         }];
         let _ = context.run_ui(raw, |ui| {
-            let controls = test_controls(ui, &context, Language::German, true, 0.5, None, false);
+            let controls = test_controls(
+                ui,
+                &context,
+                Language::German,
+                true,
+                ListeningState {
+                    progress: 0.5,
+                    ..Default::default()
+                },
+            );
             assert!(controls.heard);
         });
     }
@@ -2183,9 +2720,12 @@ mod tests {
                                 &context,
                                 language,
                                 true,
-                                0.5,
-                                paused.then_some(&warning),
-                                paused,
+                                ListeningState {
+                                    progress: 0.5,
+                                    warning: paused.then_some(&warning),
+                                    paused,
+                                    ..Default::default()
+                                },
                             );
                             assert!(
                                 !controls.heard

@@ -208,6 +208,10 @@ impl TestEngine {
         &self.trials
     }
 
+    pub fn last_threshold(&self) -> Option<&Threshold> {
+        self.completed.last().map(|(_, threshold)| threshold)
+    }
+
     fn finish_point(&mut self, outcome: ThresholdOutcome, dbfs: Option<f32>) {
         let point = self.points[self.point_index];
         self.completed.push((
@@ -230,6 +234,7 @@ impl TestEngine {
 
         let mut thresholds = Vec::new();
         let mut max_retest_difference_db: f32 = 0.0;
+        let mut repeat_range_mismatch = false;
         for ear in [Ear::Right, Ear::Left] {
             for frequency_hz in crate::domain::FREQUENCIES_HZ {
                 let entries: Vec<_> = self
@@ -246,9 +251,10 @@ impl TestEngine {
                         .iter()
                         .find(|(point, _)| point.is_retest)
                         .expect("1000 Hz retest exists");
-                    if let (Some(a), Some(b)) = (primary.1.dbfs, retest.1.dbfs) {
+                    if let (Some(a), Some(b)) = (primary.1.relative_db(), retest.1.relative_db()) {
                         max_retest_difference_db = max_retest_difference_db.max((a - b).abs());
                     }
+                    repeat_range_mismatch |= primary.1.outcome != retest.1.outcome;
                     let selected = entries
                         .iter()
                         .min_by(|a, b| {
@@ -270,6 +276,9 @@ impl TestEngine {
             self.false_positive_catches as f32 / self.catch_trials as f32
         };
         let mut reasons = Vec::new();
+        if repeat_range_mismatch {
+            reasons.push(QualityIssue::RepeatRangeMismatch.into());
+        }
         if max_retest_difference_db > 5.0 {
             reasons.push(
                 QualityIssue::RepeatDifference {
@@ -361,5 +370,70 @@ mod tests {
         let engine = TestEngine::new(Ear::Right);
         assert_eq!(engine.points.len(), 18);
         assert_eq!(engine.points.iter().filter(|p| p.is_retest).count(), 2);
+    }
+
+    #[test]
+    fn hearing_every_tone_records_a_limit_instead_of_equal_measured_thresholds() {
+        let mut engine = TestEngine::new(Ear::Right);
+        while !engine.is_complete() {
+            engine.next_presentation(false).unwrap();
+            engine.record_response(true, None).unwrap();
+        }
+        let (thresholds, _, _) = engine.finish().unwrap();
+        assert_eq!(thresholds.len(), 16);
+        assert!(thresholds.iter().all(|threshold| threshold.outcome
+            == ThresholdOutcome::BelowFloor
+            && threshold.relative_db().is_none()));
+    }
+
+    #[test]
+    fn adaptive_search_preserves_ear_differences_within_the_usable_range() {
+        let mut engine = TestEngine::new(Ear::Right);
+        while !engine.is_complete() {
+            let presentation = engine.next_presentation(false).unwrap();
+            let threshold = if presentation.ear == Ear::Right {
+                -80.0
+            } else {
+                -65.0
+            };
+            engine
+                .record_response(presentation.dbfs.unwrap() >= threshold, None)
+                .unwrap();
+        }
+        let (thresholds, _, _) = engine.finish().unwrap();
+        for threshold in thresholds {
+            assert_eq!(threshold.outcome, ThresholdOutcome::Measured);
+            assert_eq!(
+                threshold.dbfs,
+                Some(if threshold.ear == Ear::Right {
+                    -80.0
+                } else {
+                    -65.0
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn changing_between_a_measured_repeat_and_a_limit_lowers_confidence() {
+        let mut engine = TestEngine::new(Ear::Right);
+        for _ in 0..4 {
+            engine.next_presentation(true).unwrap();
+            engine.record_response(false, None).unwrap();
+        }
+        while !engine.is_complete() {
+            let is_retest = engine.points[engine.point_index].is_retest;
+            let presentation = engine.next_presentation(false).unwrap();
+            let heard = is_retest || presentation.dbfs.unwrap() >= -65.0;
+            engine.record_response(heard, None).unwrap();
+        }
+        let (_, _, quality) = engine.finish().unwrap();
+        assert!(!quality.high_confidence);
+        assert!(
+            quality
+                .reasons
+                .contains(&QualityIssue::RepeatRangeMismatch.into())
+        );
+        assert_eq!(quality.max_retest_difference_db, 0.0);
     }
 }

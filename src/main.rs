@@ -3,6 +3,7 @@ mod audio;
 mod domain;
 mod localization;
 mod report;
+mod sound_check;
 mod storage;
 mod test_engine;
 mod theme;
