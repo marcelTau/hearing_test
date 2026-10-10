@@ -100,13 +100,32 @@ frequency values. Report names and local storage details are under
 **Report identity and local data** on the overview.
 
 **Start a listening check** guides you through headphones, a quiet-space
-checklist, reference sounds, and a final review. Each step explains what is
+checklist, a sound-range check, and a final review. Each step explains what is
 needed before you can continue. Going back keeps your selections; changing
-the output device requires a fresh confirmation of the reference sound.
+the output device or volume requires a fresh sound check for both ears.
+
+The sound check plays a comfortable 1000 Hz reference in each ear, then the
+quietest available tones at 1000 and 4000 Hz in both ears. Answer after each
+tone finishes. If the quietest tones are still audible, lower the shared system
+volume and repeat the sound check. Never adjust each ear separately. If no
+shared setting works for both ears, you can explicitly continue with a limited
+range. An inaudible reference can be recorded without raising the volume.
 
 During a check, click **I hear it** or press Space only when you hear a tone.
 You can pause at any time; responses are disabled while paused. Decorative
 sound graphics stay static and do not signal tone playback.
+
+If a tone remains audible at the minimum during the full check, the test pauses.
+Choose **Restart with lower volume** to save the incomplete check as abandoned
+and repeat setup, or continue at the original volume. Completed results also
+provide a restart button while keeping the saved check. A changed volume uses
+a different setup baseline; results at different volumes are not mixed.
+
+**At/below minimum** means the actual threshold was not found. Up arrows mark
+these limits on charts; PDFs use `<=0` in the values table. They are excluded
+from exact ear differences and numerical changes over time. Two ears at the
+minimum show **Undetermined**, not a zero difference. This interpretation also
+applies to previously saved results without rewriting their raw measurements.
 
 ## Before each test
 
@@ -114,7 +133,7 @@ sound graphics stay static and do not signal tone playback.
 - Keep Noise Cancellation on.
 - Turn off Adaptive/Transparency mode, Spatial Audio, personalized volume, Conversation Awareness, Headphone Accommodations, hearing assistance, and other personalized processing.
 - Keep the same Linux output volume and AirPods fit.
-- Use the left/right reference buttons. The reference must be clearly audible but comfortable, never loud. The app never generates a tone above `-30 dBFS`.
+- Complete the sound-range check for both ears. Keep the reference comfortable, never loud, and record it as not heard if inaudible. Lower the shared volume and repeat setup if the quietest tones remain audible. The app never generates a tone above `-30 dBFS`.
 - Press Space or click **I hear it** whenever you hear a pulsed tone, even if it is very faint. Some intervals are intentionally silent.
 
 The full test covers 250, 500, 1000, 2000, 3000, 4000, 6000, and 8000 Hz in each ear and usually takes 12–18 minutes.

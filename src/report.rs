@@ -185,29 +185,34 @@ fn draw_session_curves(ops: &mut Vec<Op>, session: &TestSession, baseline: bool)
         ops.push(Op::SetOutlineThickness {
             pt: Pt(if baseline { 1.0 } else { 1.7 }),
         });
-        let points: Vec<_> = FREQUENCIES_HZ
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, frequency)| {
-                session
-                    .threshold(ear, frequency)
-                    .and_then(|threshold| threshold.relative_db())
-                    .map(|level| (frequency_x(index), level_y(level)))
-            })
-            .collect();
-        for pair in points.windows(2) {
-            line(ops, pair[0].0, pair[0].1, pair[1].0, pair[1].1);
-        }
-        if !baseline {
-            for (x, y) in points {
-                draw_symbol(ops, ear, x, y);
+        let mut previous = None;
+        for (index, frequency) in FREQUENCIES_HZ.into_iter().enumerate() {
+            let threshold = session.threshold(ear, frequency);
+            let point = threshold
+                .and_then(|threshold| threshold.relative_db())
+                .map(|level| (frequency_x(index), level_y(level)));
+            if let (Some((x1, y1)), Some((x2, y2))) = (previous, point) {
+                line(ops, x1, y1, x2, y2);
             }
-            for (index, frequency) in FREQUENCIES_HZ.into_iter().enumerate() {
-                if session
-                    .threshold(ear, frequency)
-                    .is_some_and(|threshold| threshold.outcome == ThresholdOutcome::NoResponse)
-                {
-                    draw_no_response(ops, ear, frequency_x(index), PLOT_BOTTOM + 3.0);
+            previous = point;
+            if let Some((x, y)) = point {
+                if !baseline {
+                    draw_symbol(ops, ear, x, y);
+                }
+            } else if let Some(threshold) = threshold {
+                let x = frequency_x(index);
+                match threshold.outcome {
+                    ThresholdOutcome::BelowFloor => {
+                        let x = x + if ear == Ear::Right { -5.0 } else { 5.0 };
+                        let y = PLOT_TOP - 1.0;
+                        line(ops, x, y - 15.0, x, y);
+                        line(ops, x, y, x - 4.0, y - 5.0);
+                        line(ops, x, y, x + 4.0, y - 5.0);
+                    }
+                    ThresholdOutcome::NoResponse if !baseline => {
+                        draw_no_response(ops, ear, x, PLOT_BOTTOM + 3.0);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -264,11 +269,19 @@ fn draw_table(
     }
     text(ops, x, 227.0, 6.5, language.text(Text::MeanChange));
     text(ops, x, 216.0, 6.5, language.text(Text::StrongerTone));
-    text(ops, x, 201.0, 6.5, language.text(Text::NoResponseHelp));
+    paragraph(
+        ops,
+        x,
+        201.0,
+        6.5,
+        220.0,
+        language.text(Text::ReportRangeHelp),
+    );
 }
 
 fn threshold_text(session: &TestSession, ear: Ear, frequency: u32, language: Language) -> String {
     match session.threshold(ear, frequency) {
+        Some(threshold) if threshold.outcome == ThresholdOutcome::BelowFloor => "<=0".into(),
         Some(threshold) if threshold.outcome == ThresholdOutcome::NoResponse => {
             language.text(Text::NoResponse).into()
         }
@@ -582,6 +595,53 @@ mod tests {
                     }
                     _ => {}
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn reports_label_limits_and_omit_their_numeric_changes() {
+        let mut session = sample_session();
+        for threshold in &mut session.thresholds {
+            if threshold.frequency_hz == 250 {
+                threshold.outcome = ThresholdOutcome::BelowFloor;
+                threshold.dbfs = Some(crate::domain::FLOOR_DBFS);
+            }
+        }
+        let mut baseline = sample_session();
+        baseline.id = uuid::Uuid::now_v7();
+        for language in [Language::English, Language::German] {
+            assert_eq!(threshold_text(&session, Ear::Right, 250, language), "<=0");
+            assert_eq!(threshold_text(&session, Ear::Left, 250, language), "<=0");
+            let deltas = compare_sessions(&session, &baseline).unwrap();
+            assert!(
+                deltas
+                    .iter()
+                    .filter(|delta| delta.frequency_hz == 250)
+                    .all(|delta| delta.change_db.is_none())
+            );
+            let bytes = generate_pdf(&session, Some(&baseline), None, language);
+            let parsed = PdfDocument::parse(
+                &bytes,
+                &printpdf::PdfParseOptions::default(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let text = parsed
+                .extract_text()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(text.contains("<=0"), "{text}");
+            assert!(text.contains("--"), "{text}");
+            if let Ok(directory) = std::env::var("HEARING_TEST_QA_DIR") {
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(
+                    Path::new(&directory).join(format!("report-limits-{}.pdf", language.code())),
+                    &bytes,
+                )
+                .unwrap();
             }
         }
     }

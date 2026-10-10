@@ -86,7 +86,12 @@ pub struct Threshold {
 
 impl Threshold {
     pub fn relative_db(&self) -> Option<f32> {
-        self.dbfs.map(relative_db)
+        // A boundary is an inequality, not an exact threshold. This also fixes
+        // comparisons of historical BelowFloor records without rewriting them.
+        match self.outcome {
+            ThresholdOutcome::Measured => self.dbfs.map(relative_db),
+            _ => None,
+        }
     }
 }
 
@@ -134,6 +139,7 @@ pub enum QualityReason {
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum QualityIssue {
     RepeatDifference { db: f32 },
+    RepeatRangeMismatch,
     TooFewSilentChecks,
     SilentResponses { percent: f32 },
     VolumeUnavailable,
@@ -212,6 +218,12 @@ impl TestSession {
         self.thresholds
             .iter()
             .find(|t| t.ear == ear && t.frequency_hz == frequency_hz)
+    }
+
+    pub fn has_floor_limits(&self) -> bool {
+        self.thresholds
+            .iter()
+            .any(|threshold| threshold.outcome == ThresholdOutcome::BelowFloor)
     }
 }
 
@@ -350,5 +362,43 @@ mod tests {
 
         let incompatible = completed_session("different", -50.0);
         assert!(compare_sessions(&incompatible, &baseline).is_none());
+    }
+
+    #[test]
+    fn boundary_results_are_never_exact_values_or_trend_deltas() {
+        let measured = completed_session("same", -60.0);
+        let mut limited = completed_session("same", FLOOR_DBFS);
+        limited.thresholds[0].outcome = ThresholdOutcome::BelowFloor;
+        // Historical records retain their stored minimum, but not its old
+        // interpretation as a measured zero.
+        let json = serde_json::to_string(&limited).unwrap();
+        let limited: TestSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(limited.thresholds[0].dbfs, Some(FLOOR_DBFS));
+        assert_eq!(limited.thresholds[0].relative_db(), None);
+        assert!(limited.has_floor_limits());
+        for (current, baseline) in [
+            (&limited, &measured),
+            (&measured, &limited),
+            (&limited, &limited),
+        ] {
+            let deltas = compare_sessions(current, baseline).unwrap();
+            let delta = deltas
+                .iter()
+                .find(|delta| delta.ear == Ear::Right && delta.frequency_hz == 1_000)
+                .unwrap();
+            assert_eq!(delta.change_db, None);
+        }
+        let mut no_response = limited.thresholds[0].clone();
+        no_response.outcome = ThresholdOutcome::NoResponse;
+        assert_eq!(no_response.relative_db(), None);
+    }
+
+    #[test]
+    fn changing_volume_requires_a_new_setup_baseline() {
+        let baseline = completed_session("same", -60.0);
+        let mut current = baseline.clone();
+        current.setup.sink_volume_percent = Some(20.0);
+        current.setup_fingerprint = current.setup.fingerprint();
+        assert!(compare_sessions(&current, &baseline).is_none());
     }
 }
