@@ -4,7 +4,5 @@
 !Cargo.lock
 !src/
 !src/**
-!packaging/
-!packaging/**
 !Dockerfile.ubuntu
 !Dockerfile.ubuntu.dockerignore

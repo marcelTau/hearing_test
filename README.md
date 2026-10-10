@@ -4,7 +4,7 @@ Hearing Tracker is an offline Linux desktop application for personal, repeatable
 
 It is deliberately **not** a medical device or diagnostic audiometer. AirPods and normal computer audio are not calibrated for clinical `dB HL`, and their fit, processing, volume, and the room all affect results. The app therefore reports an internal relative scale (`dB-R`) and only compares tests made with the same recorded setup.
 
-## Portable Ubuntu download
+## Prebuilt Ubuntu executable
 
 To create a release for other people, run this on a machine with Docker and
 BuildKit (Rust and Cargo are installed inside the build container):
@@ -13,26 +13,22 @@ BuildKit (Rust and Cargo are installed inside the build container):
 ./build-ubuntu.sh
 ```
 
-Share `dist/hearing-test-ubuntu-x86_64.run` and its `.sha256` checksum file.
-Recipients can launch it with one command from a terminal, even if the download
-doesn't preserve executable permission:
+The script builds the release executable inside an Ubuntu 22.04 container and
+exports it to `dist/hearing-test`, alongside `dist/hearing-test.sha256`.
+Share those files. Recipients can launch the executable from a terminal:
 
 ```sh
-sh hearing-test-ubuntu-x86_64.run
+chmod +x hearing-test  # Needed once if the download loses executable permission.
+./hearing-test
 ```
 
-The single file bundles the app, ALSA and its audio plugins/configuration,
-X11/Wayland client libraries, a software Vulkan renderer, and their dependencies.
-It automatically extracts into a temporary directory, launches the app, and
-cleans up when the app closes. Nothing is installed system-wide; it works
-offline and needs no FUSE, Rust, Cargo, Docker, or extra packages.
-
-This is a self-extracting bundle rather than a fully static ELF binary. It
-targets Ubuntu 22.04 and newer Desktop installations on Intel/AMD 64-bit
-machines, using Ubuntu's core C runtime and the running desktop/audio services.
-The bundled software renderer avoids requiring a particular GPU or additional
-graphics drivers. Results are stored separately in the user's data directory.
-ARM machines need a separate build.
+The executable targets standard Ubuntu 22.04 and newer Desktop installations
+on Intel/AMD 64-bit machines. Docker, Rust, Cargo, compilers, and development
+headers are required only on the build machine. The executable uses Ubuntu
+Desktop's existing ALSA and graphics runtime libraries; these are not bundled.
+The target is a normal Desktop installation, not a bare Ubuntu Server or Docker
+image with missing desktop libraries. ARM machines need a separate build.
+Results are stored in the user's data directory, independently of the executable.
 
 ## Build from source and run on Ubuntu
 

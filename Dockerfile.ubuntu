@@ -27,24 +27,3 @@ RUN cargo build --locked --release --bin hearing_test --jobs "$BUILD_JOBS" \
 # Export only the executable, without a container or Rust installation.
 FROM scratch AS binary
 COPY --from=build /app/target/release/hearing_test /hearing-test
-
-# Packaging tools and runtime libraries are installed only on the build
-# machine. Include libraries loaded through dlopen as well as ELF dependencies.
-FROM build AS bundle
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        python3 makeself libasound2-plugins pulseaudio-utils \
-        libx11-xcb1 libxcursor1 libxi6 libxrandr2 libxrender1 \
-        libxcb-shape0 libxcb-xfixes0 libxcb-render0 libxkbcommon-x11-0 \
-        libwayland-client0 libwayland-cursor0 libwayland-egl1 \
-        libvulkan1 mesa-vulkan-drivers libdbus-1-3 \
-    && rm -rf /var/lib/apt/lists/*
-COPY packaging ./packaging
-RUN python3 packaging/bundle-ubuntu.py \
-    && mkdir -p /out \
-    && makeself --nox11 --sha256 --quiet /bundle \
-        /out/hearing-test-ubuntu-x86_64.run "Hearing Tracker" ./AppRun
-
-# A FUSE-free self-extracting launcher: nothing is installed system-wide.
-FROM scratch AS portable
-COPY --from=bundle /out/hearing-test-ubuntu-x86_64.run /
